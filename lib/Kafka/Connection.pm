@@ -117,6 +117,10 @@ use Kafka::Internals qw(
     $APIKEY_APIVERSIONS
     $APIKEY_OFFSETCOMMIT
     $APIKEY_OFFSETFETCH
+    $APIKEY_JOINGROUP
+    $APIKEY_SYNCGROUP
+    $APIKEY_LEAVEGROUP
+    $APIKEY_HEARTBEAT
     $MAX_CORRELATIONID
     $MAX_INT32
     debug_level
@@ -135,6 +139,10 @@ use Kafka::Protocol qw(
     decode_find_coordinator_response
     decode_offsetcommit_response
     decode_offsetfetch_response
+    decode_joingroup_response
+    decode_syncgroup_response
+    decode_leavegroup_response
+    decode_heartbeat_response
     encode_fetch_request
     encode_metadata_request
     encode_offset_request
@@ -143,6 +151,10 @@ use Kafka::Protocol qw(
     encode_find_coordinator_request
     encode_offsetcommit_request
     encode_offsetfetch_request
+    encode_joingroup_request
+    encode_syncgroup_request
+    encode_leavegroup_request
+    encode_heartbeat_request
 );
 
 =head1 SYNOPSIS
@@ -232,6 +244,22 @@ my %protocol = (
     "$APIKEY_OFFSETFETCH"  => {
         decode                  => \&decode_offsetfetch_response,
         encode                  => \&encode_offsetfetch_request,
+    },
+    "$APIKEY_JOINGROUP"     => {
+        decode                  => \&decode_joingroup_response,
+        encode                  => \&encode_joingroup_request,
+    },
+    "$APIKEY_SYNCGROUP"     => {
+        decode                  => \&decode_syncgroup_response,
+        encode                  => \&encode_syncgroup_request,
+    },
+    "$APIKEY_LEAVEGROUP"    => {
+        decode                  => \&decode_leavegroup_response,
+        encode                  => \&encode_leavegroup_request,
+    },
+    "$APIKEY_HEARTBEAT"     => {
+        decode                  => \&decode_heartbeat_response,
+        encode                  => \&encode_heartbeat_request,
     },
 );
 
@@ -970,10 +998,19 @@ sub receive_response_to_request {
         $self->_error( $ERROR_MISMATCH_CORRELATIONID, "$response->{CorrelationId} != $request->{CorrelationId}", request => $request, response => $response )
             unless $response->{CorrelationId} == $request->{CorrelationId}
         ;
-        $topic_data     = $response->{topics}->[0];
-        $partition_data = $topic_data->{ $api_key == $APIKEY_OFFSET ? 'PartitionOffsets' : 'partitions' }->[0];
 
-        $ErrorCode = $partition_data->{ErrorCode};
+        if(
+                $api_key == $APIKEY_JOINGROUP
+            ||  $api_key == $APIKEY_SYNCGROUP
+            ||  $api_key == $APIKEY_LEAVEGROUP
+            ||  $api_key == $APIKEY_HEARTBEAT
+        ) {
+            $ErrorCode      = $response->{ ErrorCode };
+        } else {
+            $topic_data     = $response->{topics}->[0];
+            $partition_data = $topic_data->{ $api_key == $APIKEY_OFFSET ? 'PartitionOffsets' : 'partitions' }->[0];
+            $ErrorCode      = $partition_data->{ErrorCode};
+        }
 
         return $response if $ErrorCode == $ERROR_NO_ERROR; # success
 
@@ -983,6 +1020,14 @@ sub receive_response_to_request {
             # FATAL error
             $self->_error( $ERROR_SEND_NO_ACK, format_message( "topic='%s', partition=%s response error: %s", $topic_name, $partition, $ErrorCode ), request => $request, response => $response );
             last ATTEMPT;
+        } elsif(
+                ( $api_key == $APIKEY_JOINGROUP && $ErrorCode == $ERROR_GROUP_LOAD_IN_PROGRESS )
+            ||  ( $api_key == $APIKEY_LEAVEGROUP && $ErrorCode == $ERROR_GROUP_LOAD_IN_PROGRESS )
+            ||  ( $api_key == $APIKEY_SYNCGROUP && $ErrorCode == $ERROR_REBALANCE_IN_PROGRESS )
+            ||  ( $api_key == $APIKEY_HEARTBEAT && $ErrorCode == $ERROR_REBALANCE_IN_PROGRESS )
+        ) {
+            # allow the client to handle these responses since there is a rebalance in progress
+            return $response;
         }
 
         if ( exists $RETRY_ON_ERRORS{ $ErrorCode } ) {

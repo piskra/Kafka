@@ -26,6 +26,10 @@ our @EXPORT_OK = qw(
     decode_produce_response
     decode_offsetcommit_response
     decode_offsetfetch_response
+    decode_joingroup_response
+    decode_syncgroup_response
+    decode_leavegroup_response
+    decode_heartbeat_response
     encode_fetch_request
     encode_metadata_request
     encode_offset_request
@@ -36,6 +40,10 @@ our @EXPORT_OK = qw(
     decode_find_coordinator_response
     encode_offsetcommit_request
     encode_offsetfetch_request
+    encode_joingroup_request
+    encode_syncgroup_request
+    encode_leavegroup_request
+    encode_heartbeat_request
     _decode_MessageSet_template
     _decode_MessageSet_array
     _encode_MessageSet_array
@@ -92,6 +100,10 @@ use Kafka::Internals qw(
     $APIKEY_FINDCOORDINATOR
     $APIKEY_OFFSETCOMMIT
     $APIKEY_OFFSETFETCH
+    $APIKEY_JOINGROUP
+    $APIKEY_SYNCGROUP
+    $APIKEY_LEAVEGROUP
+    $APIKEY_HEARTBEAT
     $PRODUCER_ANY_OFFSET
     format_message
 );
@@ -1729,6 +1741,500 @@ sub decode_offsetfetch_response {
         push( @$topics_array, $topic);
     }
     return $OffsetFetch_Response;
+}
+
+# JOINGROUP Request --------------------------------------------------------------
+
+=head3 C<encode_joingroup_request( $JoinGroup_Request )>
+
+Encodes the argument and returns a reference to the encoded binary string
+representing a Request buffer.
+
+This function takes the following arguments:
+
+=over 3
+
+=item C<$JoinGroup_request>
+
+C<$JoinGroup_request> is a reference to the hash representing
+the structure of the JoinGroup Request (examples see C<t/*_decode_encode.t>).
+
+=back
+
+=cut
+$IMPLEMENTED_APIVERSIONS->{$APIKEY_JOINGROUP} = 1;
+sub encode_joingroup_request {
+    my ( $JoinGroup_request ) = @_;
+    my @data;
+    my $request = { data => \@data };
+
+    my $api_version = _encode_request_header( $request, $APIKEY_JOINGROUP, $JoinGroup_request );
+    my $is_v1 = $api_version == 1;
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $JoinGroup_request->{ GroupId } );
+
+    push @data, $JoinGroup_request->{ SessionTimeout };
+    $request->{ template }      .= q{l>};
+    $request->{ len }           += 4;
+
+    if( $is_v1 ) {
+        push @data, $JoinGroup_request->{ RebalanceTimeout };
+        $request->{ template }      .= q{l>};
+        $request->{ len }           += 4;
+    }
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $JoinGroup_request->{ MemberId } );
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $JoinGroup_request->{ ProtocolType } );
+
+    my $GroupProtocolsArray     = $JoinGroup_request->{ GroupProtocols };
+    push @data, scalar @{ $GroupProtocolsArray };
+    $request->{ template }      .= q{l>};
+    $request->{ len }           += 4;
+
+    for my $GroupProtocol ( @{ $GroupProtocolsArray } ) {
+        # ProtocolName
+        $request->{ template }  .= q{s>};
+        $request->{ len }       += 2;
+        _encode_string( $request, $GroupProtocol->{ ProtocolName } );
+
+        # ProtocolMetadata
+        my $GroupProtocolMetadata = $GroupProtocol->{ ProtocolMetadata };
+
+        my @group_protocol_data             = ();
+        my $group_protocol_message_template = q{};
+        my $group_protocol_message_length   = 0;
+
+        # Version
+        $group_protocol_message_template    .= q{s>};
+        $group_protocol_message_length      += 2;
+        push @group_protocol_data, $GroupProtocolMetadata->{ Version };
+
+        # Subscription -> [ Topic ]
+        my $group_protocol_topics_array_length = scalar @{ $GroupProtocolMetadata->{ Topic } };
+        push @group_protocol_data, $group_protocol_topics_array_length;
+        $group_protocol_message_template    .= q{l>};
+        $group_protocol_message_length      += 4;
+        for my $topic ( @{ $GroupProtocolMetadata->{ Topic } } ) {
+            my $topic_length = length $topic;
+            push @group_protocol_data, $topic_length, $topic;
+            $group_protocol_message_template    .= q{s>a*};
+            $group_protocol_message_length      += ( 2 + $topic_length );
+        }
+
+        # UserData
+        my $user_data           = $GroupProtocolMetadata->{ UserData };
+        my $user_data_length    = length $user_data;
+        $group_protocol_message_template    .= ( $user_data_length ) ? qq{l>a[$user_data_length]} : q{l>};
+        $group_protocol_message_length      += ( $user_data_length ) ? ( 4 + $user_data_length ) : 4;
+        push @group_protocol_data,
+                $user_data_length ? ( $user_data_length, $user_data ) : $NULL_BYTES_LENGTH;
+
+        push @data, $group_protocol_message_length, pack( $group_protocol_message_template, @group_protocol_data );
+        $request->{ template }  .= qq{l>a[$group_protocol_message_length]};
+        $request->{ len }       += ( 4 + $group_protocol_message_length );
+    }
+
+    return pack( $request->{ template }, $request->{ len }, @data );
+}
+
+# JOINGROUP Response --------------------------------------------------------------
+
+my $_decode_joingroup_response_template = q{x[l]l>s>l>s>/as>/as>/al>X[l]l>/(s>/al>/a)};
+                                            # x[l]                  Size ( skip )
+                                            # l>                    CorrelationId
+                                            # s>                    ErrorCode
+                                            # l>                    GenerationId
+                                            # s>/a                  Group Protocol
+                                            # s>/a                  LeaderId
+                                            # s>/a                  MemberId
+                                            # l>                    Members array size
+                                            # X[l]
+                                            # l>/(                  Members array
+                                            #   s>/a                MemberId
+                                            #   l>/a                MemberMetadata
+                                            # )
+
+=head3 C<decode_joingroup_response( $bin_stream_ref )>
+
+Decodes the argument and returns a reference to the hash representing
+the structure of the JOINGROUP Response (examples see C<t/*_decode_encode.t>).
+
+This function takes the following arguments:
+
+=over 3
+
+=item C<$bin_stream_ref>
+
+C<$bin_stream_ref> is a reference to the encoded Response buffer. The buffer
+must be a non-empty binary string.
+
+=back
+
+=cut
+sub decode_joingroup_response {
+    my ( $bin_stream_ref ) = @_;
+
+    my @data = unpack( $_decode_joingroup_response_template, $$bin_stream_ref );
+
+    my $i = 0;
+    my $JoinGroup_response = {};
+    $JoinGroup_response->{ CorrelationId }  = $data[$i++];
+    $JoinGroup_response->{ ErrorCode }      = $data[$i++];
+    $JoinGroup_response->{ GenerationId }   = $data[$i++];
+    $JoinGroup_response->{ GroupProtocol }  = $data[$i++];
+    $JoinGroup_response->{ LeaderId }       = $data[$i++];
+    $JoinGroup_response->{ MemberId }       = $data[$i++];
+    my $Members_array = $JoinGroup_response->{ Members } = [];
+    my $Members_array_size                  = $data[$i++];
+    while( $Members_array_size-- ) {
+        push @{ $Members_array }, {
+            MemberId            => $data[$i++],
+            MemberMetadata      => $data[$i++], # TODO : unpack MemberMetadata accordingly
+        };
+    }
+
+    return $JoinGroup_response;
+}
+
+# SYNCGROUP Request --------------------------------------------------------------
+
+=head3 C<encode_syncgroup_request( $SyncGroup_request )>
+
+Encodes the argument and returns a reference to the encoded binary string
+representing a Request buffer.
+
+This function takes the following arguments:
+
+=over 3
+
+=item C<$SyncGroup_request>
+
+C<$SyncGroup_request> is a reference to the hash representing
+the structure of the SyncGroup Request (examples see C<t/*_decode_encode.t>).
+
+=back
+
+=cut
+$IMPLEMENTED_APIVERSIONS->{$APIKEY_SYNCGROUP} = 0;
+sub encode_syncgroup_request {
+    my ( $SyncGroup_request ) = @_;
+    my @data;
+    my $request = { data => \@data };
+
+    _encode_request_header( $request, $APIKEY_SYNCGROUP, $SyncGroup_request );
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $SyncGroup_request->{ GroupId } );
+
+    push @data, $SyncGroup_request->{ GenerationId };
+    $request->{ template }      .= q{l>};
+    $request->{ len }           += 4;
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $SyncGroup_request->{ MemberId } );
+
+    my $GroupAssignmentArray    = $SyncGroup_request->{ GroupAssignment };
+    push @data, scalar @{ $GroupAssignmentArray };
+    $request->{ template }      .= q{l>};
+    $request->{ len }           += 4;
+
+    for my $GroupAssignment ( @{ $GroupAssignmentArray } ) {
+        # MemberId
+        $request->{ template }  .= q{s>};
+        $request->{ len }       += 2;
+        _encode_string( $request, $GroupAssignment->{ MemberId } );
+
+        # MemberAssignment
+        my $MemberAssignment = $GroupAssignment->{ MemberAssignment };
+
+        my @member_assignment_data             = ();
+        my $member_assignment_message_template = q{};
+        my $member_assignment_message_length   = 0;
+
+        # Version
+        $member_assignment_message_template    .= q{s>};
+        $member_assignment_message_length      += 2;
+        push @member_assignment_data, $MemberAssignment->{ Version };
+
+        # PartitionAssignment => [ Topic [ Partition ] ]
+        my $partition_assignment_array_length = scalar @{ $MemberAssignment->{ PartitionAssignment } };
+        push @member_assignment_data, $partition_assignment_array_length;
+        $member_assignment_message_template    .= q{l>};
+        $member_assignment_message_length      += 4;
+
+        for my $partition_assignment ( @{ $MemberAssignment->{ PartitionAssignment } } ) {
+            # Topic
+            my $topic           = (keys %{ $partition_assignment })[0];
+            my $topic_length    = length $topic;
+            push @member_assignment_data, $topic_length, $topic;
+            $member_assignment_message_template     .= q{s>a*};
+            $member_assignment_message_length       += ( 2 + $topic_length );
+            # Partitions
+            my $partitions              = (values %{ $partition_assignment })[0];
+            my $partitions_array_size   = scalar @{ $partitions };
+            push @member_assignment_data, $partitions_array_size;
+            $member_assignment_message_template     .= q{l>};
+            $member_assignment_message_length       += 4;
+
+            for my $partition ( @{ $partitions } ) {
+                push @member_assignment_data, $partition;
+                $member_assignment_message_template     .= q{l>};
+                $member_assignment_message_length       += 4;
+            }
+        }
+
+        # UserData
+        my $user_data           = $MemberAssignment->{ UserData };
+        my $user_data_length    = length $user_data;
+        $member_assignment_message_template .= ( $user_data_length ) ? qq{l>a[$user_data_length]} : q{l>};
+        $member_assignment_message_length  += ( $user_data_length ) ? ( 4 + $user_data_length ) : 4;
+        push @member_assignment_data,
+                $user_data_length ? ( $user_data_length, $user_data ) : $NULL_BYTES_LENGTH;
+
+        push @data, $member_assignment_message_length, pack( $member_assignment_message_template, @member_assignment_data );
+        $request->{ template }  .= qq{l>a[$member_assignment_message_length]};
+        $request->{ len }       += ( 4 + $member_assignment_message_length );
+    }
+
+    return pack( $request->{ template }, $request->{ len }, @data );
+}
+
+# SYNCGROUP Response --------------------------------------------------------------
+
+my $_decode_syncgroup_response_template = q{x[l]l>s>l>/a};
+                                            # x[l]              # Size ( skip )
+                                            # l>                # CorrelationId
+                                            # s>                # ErrorCode
+                                            # l>/a              # MemberAssignment
+
+my $_decode_syncgroup_member_assignment_data_template = q{s>l>X[l]l>(s>/al>X[l]l>/(l>))};
+                                                            # s>                # Version
+                                                            # l>                # PartitionAssignment array size
+                                                            # X[l]
+                                                            # l>/(              # PartitionAssignment array
+                                                            #   s>/a            # Topic
+                                                            #   l>              # Partitions array size
+                                                            #   X[l]
+                                                            #   l>/(            # Partitions array
+                                                            #       l>          # PartitionId
+                                                            #    )
+                                                            # )
+
+=head3 C<decode_syncgroup_response( $bin_stream_ref )>
+
+Decodes the argument and returns a reference to the hash representing
+the structure of the SYNCGROUP Response (examples see C<t/*_decode_encode.t>).
+
+This function takes the following arguments:
+
+=over 3
+
+=item C<$bin_stream_ref>
+
+C<$bin_stream_ref> is a reference to the encoded Response buffer. The buffer
+must be a non-empty binary string.
+
+=back
+
+=cut
+sub decode_syncgroup_response {
+    my ( $bin_stream_ref ) = @_;
+
+    my @data = unpack( $_decode_syncgroup_response_template, $$bin_stream_ref );
+
+    my $i = 0;
+    my $SyncGroup_response = {};
+    $SyncGroup_response->{ CorrelationId }      = $data[$i++];
+    $SyncGroup_response->{ ErrorCode }          = $data[$i++];
+    $SyncGroup_response->{ MemberAssignment }   = {};
+
+    my $member_assignment_data_bytes            = $data[$i++];
+    return $SyncGroup_response
+        unless length( $member_assignment_data_bytes );
+
+    my $member_assignment       = $SyncGroup_response->{ MemberAssignment };
+    my @member_assignment_data  = unpack( q{s>l>X[l]l>(s>/al>X[l]l>/(l>))}, $member_assignment_data_bytes );
+
+    my $j = 0;
+    $j++; # FIXME : getting an extra thing I dont understand
+    $member_assignment->{ Version } = $member_assignment_data[$j++];
+    my $partition_assignment = $member_assignment->{ PartitionAssignment } = [];
+    my $partition_assignment_array_size = $member_assignment_data[$j++];
+    while( $partition_assignment_array_size-- ) {
+        my $topic_name = $member_assignment_data[$j++];
+        my $partitions_array_size = $member_assignment_data[$j++];
+        my $partitions = [];
+        while( $partitions_array_size-- ) {
+            push @{ $partitions }, $member_assignment_data[$j++];
+        }
+        push @{ $partition_assignment }, { $topic_name => $partitions };
+    }
+
+    return $SyncGroup_response;
+}
+
+# LEAVEGROUP Request ------------------------------------------------------------
+
+=head3 C<encode_leavegroup_request( $LeaveGroup_request )>
+
+Encodes the argument and returns a reference to the encoded binary string
+representing a Request buffer.
+
+This function takes the following arguments:
+
+=over 3
+
+=item C<$LeaveGroup_request>
+
+C<$LeaveGroup_request> is a reference to the hash representing
+the structure of the LeaveGroup Request (examples see C<t/*_decode_encode.t>).
+
+=back
+
+=cut
+$IMPLEMENTED_APIVERSIONS->{$APIKEY_LEAVEGROUP} = 0;
+sub encode_leavegroup_request {
+    my ( $LeaveGroup_request ) = @_;
+    my @data;
+    my $request = { data => \@data };
+
+    _encode_request_header( $request, $APIKEY_LEAVEGROUP, $LeaveGroup_request );
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $LeaveGroup_request->{ GroupId } );
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $LeaveGroup_request->{ MemberId } );
+
+    return pack( $request->{ template }, $request->{ len }, @data );
+}
+
+# LEAVEGROUP Response --------------------------------------------------------------
+
+my $_decode_leavegroup_response_template = q{x[l]l>s>};
+                                            # x[l]              # Size ( skip )
+                                            # l>                # CorrelationId
+                                            # s>                # ErrorCode
+
+=head3 C<decode_leavegroup_response( $bin_stream_ref )>
+
+Decodes the argument and returns a reference to the hash representing
+the structure of the LEAVEGROUP Response (examples see C<t/*_decode_encode.t>).
+
+This function takes the following arguments:
+
+=over 3
+
+=item C<$bin_stream_ref>
+
+C<$bin_stream_ref> is a reference to the encoded Response buffer. The buffer
+must be a non-empty binary string.
+
+=back
+
+=cut
+
+sub decode_leavegroup_response {
+    my ( $bin_stream_ref ) = @_;
+
+    my @data = unpack( $_decode_leavegroup_response_template, $$bin_stream_ref );
+
+    my $i = 0;
+    my $LeaveGroup_response = {};
+    $LeaveGroup_response->{ CorrelationId }      = $data[$i++];
+    $LeaveGroup_response->{ ErrorCode }          = $data[$i++];
+
+    return $LeaveGroup_response;
+}
+
+# HEARTBEAT Request --------------------------------------------------------------
+
+=head3 C<encode_heartbeat_request( $Heartbeat_request )>
+
+Encodes the argument and returns a reference to the encoded binary string
+representing a Request buffer.
+
+This function takes the following arguments:
+
+=over 3
+
+=item C<$Heartbeat_request>
+
+C<$Heartbeat_request> is a reference to the hash representing
+the structure of the Heartbeat Request (examples see C<t/*_decode_encode.t>).
+
+=back
+
+=cut
+$IMPLEMENTED_APIVERSIONS->{$APIKEY_HEARTBEAT} = 0;
+sub encode_heartbeat_request {
+    my ( $Heartbeat_request ) = @_;
+    my @data;
+    my $request = { data => \@data };
+
+    _encode_request_header( $request, $APIKEY_HEARTBEAT, $Heartbeat_request );
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $Heartbeat_request->{ GroupId } );
+
+    push @data, $Heartbeat_request->{ GenerationId };
+    $request->{ template }      .= q{l>};
+    $request->{ len }           += 4;
+
+    $request->{ template }      .= q{s>};
+    $request->{ len }           += 2;
+    _encode_string( $request, $Heartbeat_request->{ MemberId } );
+
+    return pack( $request->{ template }, $request->{ len }, @data );
+}
+
+# HEARTBEAT Response --------------------------------------------------------------
+
+my $_decode_heartbeat_response_template = q{x[l]l>s>};
+                                            # x[l]      Size ( skip )
+                                            # l>        CorrelationId
+                                            # s>        ErrorCode
+
+=head3 C<decode_heartbeat_response( $bin_stream_ref )>
+
+Decodes the argument and returns a reference to the hash representing
+the structure of the HEARTBEAT Response (examples see C<t/*_decode_encode.t>).
+
+This function takes the following arguments:
+
+=over 3
+
+=item C<$bin_stream_ref>
+
+C<$bin_stream_ref> is a reference to the encoded Response buffer. The buffer
+must be a non-empty binary string.
+
+=back
+
+=cut
+sub decode_heartbeat_response {
+    my ( $bin_stream_ref ) = @_;
+
+    my @data = unpack( $_decode_heartbeat_response_template, $$bin_stream_ref );
+
+    my $i = 0;
+    my $Heartbeat_response = {};
+    $Heartbeat_response->{ CorrelationId }  = $data[$i++];
+    $Heartbeat_response->{ ErrorCode }      = $data[$i++];
+
+    return $Heartbeat_response;
 }
 
 #-- private functions ----------------------------------------------------------

@@ -33,6 +33,10 @@ our @EXPORT_OK = qw(
     $APIKEY_APIVERSIONS
     $APIKEY_OFFSETCOMMIT
     $APIKEY_OFFSETFETCH
+    $APIKEY_JOINGROUP
+    $APIKEY_HEARTBEAT
+    $APIKEY_LEAVEGROUP
+    $APIKEY_SYNCGROUP
     $DEFAULT_RAISE_ERROR
     $MAX_CORRELATIONID
     $MAX_INT16
@@ -150,6 +154,34 @@ The numeric code that the C<ApiKey> in the request take for the C<ApiVersions> r
 
 =cut
 const our $APIKEY_APIVERSIONS                   => 18;
+
+=head3 C<$APIKEY_JOINGROUP>
+
+The numeric code that the C<ApiKey> in the request take for the C<JoinGroupRequest> request type.
+
+=cut
+const our $APIKEY_JOINGROUP                     => 11;
+
+=head3 C<$APIKEY_HEARTBEAT>
+
+The numeric code that the C<ApiKey> in the request take for the C<HeartbeatRequest> request type.
+
+=cut
+const our $APIKEY_HEARTBEAT                     => 12;
+
+=head3 C<$APIKEY_LEAVEGROUP>
+
+The numeric code that the C<ApiKey> in the request take for the C<LeaveGroupRequest> request type.
+
+=cut
+const our $APIKEY_LEAVEGROUP                    => 13;
+
+=head3 C<$APIKEY_OFFSETFETCH>
+
+The numeric code that the C<ApiKey> in the request take for the C<SyncGroupRequest> request type.
+
+=cut
+const our $APIKEY_SYNCGROUP                     => 14;
 
 # Important configuration properties
 
