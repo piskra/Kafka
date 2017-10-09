@@ -18,6 +18,8 @@ our $VERSION = '1.07';
 
 use Carp;
 use Params::Util qw(
+    _ARRAY0
+    _ARRAY
     _INSTANCE
     _NONNEGINT
     _NUMBER
@@ -50,6 +52,10 @@ use Kafka::Internals qw(
     $APIKEY_OFFSET
     $APIKEY_OFFSETCOMMIT
     $APIKEY_OFFSETFETCH
+    $APIKEY_JOINGROUP
+    $APIKEY_LEAVEGROUP
+    $APIKEY_SYNCGROUP
+    $APIKEY_HEARTBEAT
     $MAX_INT32
     _get_CorrelationId
     _isbig
@@ -679,7 +685,7 @@ sub _query_offsets {
     return $offsets;
 }
 
-=head3 C<commit_offsets( $topic, $partition, $offset, $group )>
+=head3 C<commit_offsets( $topic, $partition, $offset, $group, $generation_id, $member_id )>
 
 Commit offsets using the offset commit/fetch API.
 
@@ -713,12 +719,41 @@ The name of the consumer group
 
 The argument must be a normal non-false string of non-zero length.
 
+=item C<$generation_id>
+
+Integer value that describes group state as on the coordinator. When the
+coordinator rebalances the group, it increments this value to ascertain
+every member updates their local state.
+
+If a member does not update this state and sends an old generation_id, it
+causes ILLEGAL_GENERATION errors when included in new subsequent requests.
+
+The value must be a non-negative integer as received in a previous C<join_group>
+or C<send_heartbeat> response.
+
+Note: For API usage earlier than Version 1, the client can choose to send -1
+or not send anything at all, in which case the implementation passes a -1 to
+Kafka.
+
+=item C<$member_id>
+
+String value used to uniquely identify a member in the current consumer group.
+
+Note: For API usage earlier than Version 1, the client can choose to send ""
+( empty string ) or not send anything at all, in which case the implementation
+passes an empty string to Kafka.
+
 =back
 
 =cut
 sub commit_offsets {
-    my ( $self, $topic, $partition, $offset, $group ) = @_;
+    my ( $self, $topic, $partition, $offset, $group, $generation_id, $member_id ) = @_;
 
+    # TODO: This here is to maintain backward compatibility with clients that
+    # are still using $api_version = 0. Should be cleaned up in a future
+    # release.
+    $generation_id  //= -1;
+    $member_id      //= "";
 
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'topic' )
         unless defined( $topic ) && ( $topic eq q{} || defined( _STRING( $topic ) ) ) && !utf8::is_utf8( $topic );
@@ -728,6 +763,10 @@ sub commit_offsets {
         unless defined( $offset ) && ( ( _isbig( $offset ) && $offset >= 0 ) || defined( _NONNEGINT( $offset ) ) );
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group' )
         unless defined( $group ) && ( $group eq q{} || defined( _STRING( $group ) ) ) && !utf8::is_utf8( $group );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'generation_id' )
+        unless defined( $generation_id ) && isint( $generation_id );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'member_id' )
+        unless defined( $member_id ) && ( $member_id eq q{} || defined( _STRING( $member_id ) ) ) && !utf8::is_utf8( $member_id );
 
     my $request = {
         __send_to__               => 'group_coordinator',
@@ -735,6 +774,8 @@ sub commit_offsets {
         CorrelationId             => _get_CorrelationId(),
         ClientId                  => $self->{ClientId},
         GroupId                   => $group,
+        GenerationId              => $generation_id,
+        MemberId                  => $member_id,
         topics  => [
             {
                 TopicName         => $topic,
@@ -807,6 +848,413 @@ sub fetch_offsets {
                 ],
             },
         ],
+    };
+
+    return $self->{Connection}->receive_response_to_request( $request );
+}
+
+=head3 C<join_group( $topic, $group, $session_timeout, $member_id, $protocol_type, $group_protocols, $rebalance_timeout )>
+
+Allows a consumer process to join the given consumer group using the Group Membership API.
+
+Returns a non-blank value (a reference to a hash with server response description)
+if the message is successfully sent.
+
+C<join_group()> takes the following arguments:
+
+=over 3
+
+=item C<$group>
+
+The name of the consumer group
+
+The argument must be a normal non-false string of non-zero length.
+
+=item C<$session_timeout>
+
+Used to indicate client liveness, if the coordinator does not receive atleast one
+heartbeat before expiration of the session_timeout, then the member will be removed
+from the group.
+
+The argument must be a non-negative integer described in number of milliseconds.
+
+=item C<$member_id>
+
+Unique identifier to identify each member of the consumer group. When a member first
+joins a group, it can pass an `empty string` as member_id. Every subsequent request to
+the Group Membership API/s should include the member_id as received in the join_group
+response.
+
+The argument must be an "" ( empty string ) or a string value as obtained from a previous
+C<join_group()> response.
+
+=item C<$protocol_type>
+
+Used to define the embedded protocol that the group implements. The group coordinator
+ensures that all members in the group support the same protocol type. The meaning of
+the protocol name and protocol metadata contained in the GroupProtocols field depends
+on this value.
+
+The argument must be a non-empty string. For a general purpose consumer, the protocol
+recommends to keep this value as "consumer" so that all Kafka tooling works correctly
+across all clients.
+
+Kafka Connect uses the "connect" protocol type and its protocol details are internal to
+the Connect representation.
+
+=item C<$group_protocols>
+
+Data structure depicting protocol name and protocol metadata used by the group coordinator
+to ensure all members in the group support the same membership semantics.
+
+Expects a reference to a list containing hashes describing ProtocolName and ProtocolMetadata,
+e.g.
+[
+    {
+        ProtocolName        => <some_protocol_name>,
+        ProtocolMetadata    => {
+            Version     => <some_version>,
+            Topic       => [ <topic/s> ],
+            UserData    => <some_user_data_in_bytes>,
+        },
+    },
+]
+
+=item C<$rebalance_timeout>
+
+Prior to 0.10.1, session_timeout was used as timeout to complete a needed rebalance.
+In 0.10.1, a new version of the JoinGroup request was created with a separate
+RebalanceTimeout field. Once a rebalance begins, each client has upto this duration to
+rejoin.
+
+The argument must be a non-negative integer described in number of milliseconds.
+
+=back
+
+A C<join_group()> response hashref includes the following fields:
+
+=over 3
+
+=item C<ErrorCode>
+
+Integer value that describes one of the possible error codes as depicted by the
+protocol. Most important being GROUP_LOAD_IN_PROGRESS (14 ) in which case the
+client needs to retry joining the group again. For other error codes, refer the
+protocol specification.
+
+=item C<GenerationId>
+
+Integer value that describes group state as on the coordinator. When the
+coordinator rebalances the group, it increments this value to ascertain
+every member updates their local state.
+
+If a member does not update this state and sends an old generation_id, it
+will cause ILLEGAL_GENERATION errors when included in new subsequent requests.
+
+The value must be a non-negative integer as received in a previous C<join_group>
+or C<send_heartbeat> response.
+
+=item C<GroupProtocol>
+
+String value describing the name of the group protocol that the coordinator decided
+to use ( from the group_protocols param as provided by each member ) for the current
+rebalance state machine. This is helpful in the case of graceful upgrades when changing
+the kind of protocol each group member conforms to.
+
+=item C<LeaderId>
+
+String value used to uniquely identify if the current member is the chosen leader of
+the current consumer group.
+
+When LeaderId equals MemberId, the current member needs to perform the responsibility
+of generating partition assignments for each expected member in the group.
+
+=item C<MemberId>
+
+String value used to uniquely identify a member in the current consumer group.
+
+=item C<Members>
+
+An array for the members of the group along with their associated metadata. This is
+also only populated for the leader to reduce the overall overhead of the protocol,
+for other members it remains empty. This is further used by the leader to prepare
+member state for the `sync` group phase.
+
+The member metadata returned in the response ( to the leader ) corresponds to the
+respective metadata provided in the C<join_group()> request for the protocol chosen
+by the coordinator, by each member.
+
+=back
+
+=cut
+sub join_group {
+    my ( $self, $group, $session_timeout, $member_id, $protocol_type, $group_protocols, $rebalance_timeout ) = @_;
+
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group' )
+        unless defined( $group ) && ( $group eq q{} || defined( _STRING( $group ) ) ) && !utf8::is_utf8( $group );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'session_timeout' )
+        unless defined( $session_timeout ) && isint( $session_timeout ) && $session_timeout > 0;
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'member_id' )
+        unless defined( $member_id );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'protocol_type' )
+        unless defined( $protocol_type ) && ( $protocol_type eq q{} || defined( _STRING( $protocol_type ) ) ) && !utf8::is_utf8( $protocol_type );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group_protocols' )
+        unless defined( _ARRAY( $group_protocols ) );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'rebalance_timeout' )
+        unless defined( $rebalance_timeout ) && isint( $rebalance_timeout ) && $rebalance_timeout > 0;
+
+    my $request = {
+        __send_to__                 => 'group_coordinator',
+        ApiKey                      => $APIKEY_JOINGROUP,
+        CorrelationId               => _get_CorrelationId(),
+        ClientId                    => $self->{ ClientId },
+        GroupId                     => $group,
+        SessionTimeout              => $session_timeout,
+        RebalanceTimeout            => $rebalance_timeout,
+        MemberId                    => $member_id,
+        ProtocolType                => $protocol_type,
+        GroupProtocols              => $group_protocols,
+    };
+
+    return $self->{Connection}->receive_response_to_request( $request );
+}
+
+=head3 C<sync_group( $group, $generation_id, $member_id, $group_assignment )>
+
+Allows a consumer process to sync consumer-specific data such as group/partition
+assignment to the group leader using the Group Membership API.
+
+Returns a non-blank value (a reference to a hash with server response description)
+if the message is successfully sent.
+
+C<sync_group()> takes the following arguments:
+
+=over 3
+
+=item C<$group>
+
+The name of the consumer group
+
+The argument must be a normal non-false string of non-zero length.
+
+=item C<$generation_id>
+
+Upon completion of the join group phase, the coordinator generates a GenerationId for
+the given consumer group. This value from the JoinGroup response then needs to be passed
+into the SyncGroup request.
+
+The argument must be non-negative integer as obtained from a previous C<join_group()>
+response.
+
+=item C<$member_id>
+
+Unique identifier to identify each member of the consumer group.
+
+The argument must be a non-empty string value as obtained from a previous C<join_group()>
+response.
+
+=item C<$group_assignment>
+
+Data structure depicting assignment of topics/partitions for the given member in the
+consumer group.
+
+Expects a reference to a list containing hashes describing MemberId and MemberAssignment
+data, e.g.
+[
+    {
+        MemberId            => <some_member_id>,
+        MemberAssignment    => {
+            Version             => 1,
+            PartitionAssignment => [
+                {
+                    <topic> => [ <partition_id/s> ],
+                }
+            ],
+            UserData            => <some_user_data_in_bytes>,
+        },
+    },
+]
+
+=back
+
+A C<sync_group()> response hashref has the following fields:
+
+=over 3
+
+=item C<ErrorCode>
+
+Integer value that describes one of the possible error codes as depicted by the
+protocol. Most important being REBALANCE_IN_PROGRESS ( 27 ) in which case the
+client needs to retry joining the group again. For other error codes, refer the
+protocol specification.
+
+=item C<MemberAssignment>
+
+Reference to a hash describing partition assignment for the current member, as
+decided by the group leader, e.g.
+{
+    Version             => 1,
+    PartitionAssignment => [
+        {
+            <topic> => [ <partition_id/s> ],
+        }
+    ],
+    UserData            => <some_user_data_in_bytes>,
+},
+
+=back
+
+=cut
+sub sync_group {
+    my ( $self, $group, $generation_id, $member_id, $group_assignment ) = @_;
+
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group' )
+        unless defined( $group ) && ( $group eq q{} || defined( _STRING( $group ) ) ) && !utf8::is_utf8( $group );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'generation_id' )
+        unless defined( $generation_id ) && isint( $generation_id ) && $generation_id > 0;
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'member_id' )
+        unless defined( $member_id ) && ( $member_id eq q{} || defined( _STRING( $member_id ) ) ) && !utf8::is_utf8( $member_id );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group_assignment' )
+        unless defined( _ARRAY0( $group_assignment ) || _ARRAY( $group_assignment ) );
+
+    my $request = {
+        __send_to__                 => 'group_coordinator',
+        ApiKey                      => $APIKEY_SYNCGROUP,
+        CorrelationId               => _get_CorrelationId(),
+        ClientId                    => $self->{ ClientId },
+        GroupId                     => $group,
+        GenerationId                => $generation_id,
+        MemberId                    => $member_id,
+        GroupAssignment             => $group_assignment,
+    };
+
+    return $self->{Connection}->receive_response_to_request( $request );
+}
+
+=head3 C<leave_group( $group, $member_id )>
+
+Allows a consumer process to gracefully leave a consumer group using the Group Membership API.
+
+Returns a non-blank value (a reference to a hash with server response description)
+if the message is successfully sent.
+
+C<leave_group()> takes the following arguments:
+
+=over 3
+
+=item C<$group>
+
+The name of the consumer group
+
+The argument must be a normal non-false string of non-zero length.
+
+=item C<$member_id>
+
+Unique identifier to identify each member of the consumer group.
+
+The argument must be a non-empty string value as obtained from a previous C<join_group()>
+response.
+
+A C<leave_group()> response hashref includes the following fields:
+
+=over 3
+
+=item C<ErrorCode>
+
+Integer value that describes one of the possible error codes as depicted by the
+protocol. For error codes, refer the protocol specification.
+
+=back
+
+=cut
+sub leave_group {
+    my ( $self, $group, $member_id ) = @_;
+
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group' )
+        unless defined( $group ) && ( $group eq q{} || defined( _STRING( $group ) ) ) && !utf8::is_utf8( $group );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'member_id' )
+        unless defined( $member_id ) && ( $member_id eq q{} || defined( _STRING( $member_id ) ) ) && !utf8::is_utf8( $member_id );
+
+    my $request = {
+        __send_to__                 => 'group_coordinator',
+        ApiKey                      => $APIKEY_LEAVEGROUP,
+        CorrelationId               => _get_CorrelationId(),
+        ClientId                    => $self->{ ClientId },
+        GroupId                     => $group,
+        MemberId                    => $member_id,
+    };
+
+    return $self->{Connection}->receive_response_to_request( $request );
+}
+
+=head3 C<send_heartbeat( $group, $generation_id, $member_id )>
+
+Allows a consumer process to send periodic heartbeats to ascertain aliveness within its
+consumer group, using the Group Membership API.
+
+Returns a non-blank value (a reference to a hash with server response description)
+if the message is successfully sent.
+
+C<send_heartbeat()> takes the following arguments:
+
+=over 3
+
+=item C<$group>
+
+The name of the consumer group
+
+The argument must be a normal non-false string of non-zero length.
+
+=item C<$generation_id>
+
+Upon completion of the join group phase, the coordinator generates a GenerationId for
+the given consumer group. This value from the JoinGroup response then needs to be passed
+into the Heartbeat request.
+
+The argument must be non-negative integer as obtained from a previous C<join_group()>
+response.
+
+=item C<$member_id>
+
+Unique identifier to identify each member of the consumer group.
+
+The argument must be a non-empty string value as obtained from a previous C<join_group()>
+response.
+
+=back
+
+A C<send_heartbeat()> response hashref includes the following fields:
+
+=over 3
+
+=item C<ErrorCode>
+
+Integer value that describes one of the possible error codes as depicted by the
+protocol. Most important being REBALANCE_IN_PROGRESS ( 27 ) in which case the
+client needs to retry joining the group again. For other error codes, refer to
+the protocol specification.
+
+=back
+
+=cut
+sub send_heartbeat {
+    my ( $self, $group, $generation_id, $member_id ) = @_;
+
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group' )
+        unless defined( $group ) && ( $group eq q{} || defined( _STRING( $group ) ) ) && !utf8::is_utf8( $group );
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'generation_id' )
+        unless defined( $generation_id ) && isint( $generation_id ) && $generation_id > 0;
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'member_id' )
+        unless defined( $member_id ) && ( $member_id eq q{} || defined( _STRING( $member_id ) ) ) && !utf8::is_utf8( $member_id );
+
+    my $request = {
+        __send_to__                 => 'group_coordinator',
+        ApiKey                      => $APIKEY_HEARTBEAT,
+        CorrelationID               => _get_CorrelationId(),
+        ClientId                    => $self->{ ClientId },
+        GroupId                     => $group,
+        GenerationId                => $generation_id,
+        MemberId                    => $member_id,
     };
 
     return $self->{Connection}->receive_response_to_request( $request );
