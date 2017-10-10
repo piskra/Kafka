@@ -1075,11 +1075,7 @@ data, e.g.
     },
 ]
 
-=back
-
 A C<sync_group()> response hashref has the following fields:
-
-=over 3
 
 =item C<ErrorCode>
 
@@ -1157,8 +1153,6 @@ response.
 
 A C<leave_group()> response hashref includes the following fields:
 
-=over 3
-
 =item C<ErrorCode>
 
 Integer value that describes one of the possible error codes as depicted by the
@@ -1221,11 +1215,7 @@ Unique identifier to identify each member of the consumer group.
 The argument must be a non-empty string value as obtained from a previous C<join_group()>
 response.
 
-=back
-
 A C<send_heartbeat()> response hashref includes the following fields:
-
-=over 3
 
 =item C<ErrorCode>
 
