@@ -329,6 +329,11 @@ can be imported from L<Kafka|Kafka> module.
 
 =cut
 sub fetch {
+    my $self = shift;
+    return Kafka::IO::_sync( $self->async_fetch( @_ ) );
+}
+
+sub async_fetch {
     my ( $self, $topic, $partition, $start_offset, $max_size, $_return_all, $api_version ) = @_;
     # Special argument: $_return_all - return redundant messages sent out of a compressed package posts
 
@@ -363,7 +368,16 @@ sub fetch {
         ],
     };
 
-    my $response = $self->{Connection}->receive_response_to_request( $request, undef, $self->{MaxWaitTime} );
+    my $promise = $self->{Connection}->async_receive_response_to_request( $request, undef, $self->{MaxWaitTime} );
+
+    return $promise->then( sub {
+            return $self->_fetch_process_response( $_[0], $topic, $partition, $start_offset, $max_size, $_return_all, $api_version );
+        } );
+}
+
+sub _fetch_process_response
+{
+    my ( $self, $response, $topic, $partition, $start_offset, $max_size, $_return_all, $api_version ) = @_;
 
     my $messages = [];
     foreach my $received_topic ( @{ $response->{topics} } ) {
@@ -427,6 +441,7 @@ sub fetch {
     return $messages;
 }
 
+
 =head3 C<offset_at_time( $topic, $partition, $time )>
 
 Returns an offset, given a topic, partition and time.
@@ -467,7 +482,7 @@ system.
 
 =cut
 
-sub offset_at_time {
+sub async_offset_at_time {
     my ( $self, $topic, $partition, $time ) = @_;
 
     # we don't accept special values for $time, we want a real timestamp
@@ -475,7 +490,7 @@ sub offset_at_time {
         unless defined( $time ) && ( _isbig( $time ) || isint( $time ) ) && $time >= 0;
 
     # no max_number, api version = 1
-    return $self->_query_offsets($topic, $partition, $time, undef, 1)->[0];
+    return $self->_async_query_offsets($topic, $partition, $time, undef, 1)->[0];
 }
 
 =head3 C<offset_before_time( $topic, $partition, $time )>
@@ -513,7 +528,7 @@ system.
 
 =cut
 
-sub offset_before_time {
+sub async_offset_before_time {
     my ( $self, $topic, $partition, $time ) = @_;
 
     # we don't accept special values for $time, we want a real timestamp
@@ -523,7 +538,7 @@ sub offset_before_time {
     #     unless !defined( $max_number ) || ( _POSINT( $max_number ) && $max_number <= $MAX_INT32 );
 
     # max_number = 1, api version = 0
-    return $self->_query_offsets($topic, $partition, $time, 1, 0)->[0];
+    return $self->_async_query_offsets($topic, $partition, $time, 1, 0)->[0];
 }
 
 =head3 C<offset_earliest( $topic, $partition )>
@@ -546,11 +561,11 @@ The C<$partitions> must be a non-negative integers.
 
 =cut
 
-sub offset_earliest {
+sub async_offset_earliest {
     my ( $self, $topic, $partition ) = @_;
 
     # max_number = 1, api version = 0
-    return $self->_query_offsets($topic, $partition, $RECEIVE_EARLIEST_OFFSET, 1, 0)->[0];
+    return $self->_async_query_offsets($topic, $partition, $RECEIVE_EARLIEST_OFFSET, 1, 0)->[0];
 }
 
 =head3 C<offset_latest( $topic, $partition )>
@@ -573,11 +588,11 @@ The C<$partitions> must be a non-negative integers.
 
 =cut
 
-sub offset_latest {
+sub async_offset_latest {
     my ( $self, $topic, $partition ) = @_;
 
     # max_number = 1, api version = 0
-    return $self->_query_offsets($topic, $partition, $RECEIVE_LATEST_OFFSETS, 1, 0)->[0];
+    return $self->_async_query_offsets($topic, $partition, $RECEIVE_LATEST_OFFSETS, 1, 0)->[0];
 }
 
 =head3 C<offsets( $topic, $partition, $time, $max_number )>
@@ -614,8 +629,11 @@ Maximum number of offsets to be returned
 =back
 
 =cut
-
 sub offsets {
+    my $self = shift;
+    return Kafka::IO::_sync( $self->async_offsets( @_ ) );
+}
+sub async_offsets {
     my ( $self, $topic, $partition, $time, $max_number ) = @_;
 
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'time' )
@@ -623,18 +641,16 @@ sub offsets {
     $self->_error( $ERROR_MISMATCH_ARGUMENT, format_message( 'max_number (%s)', $max_number ) )
         unless !defined( $max_number ) || ( _POSINT( $max_number ) && $max_number <= $MAX_INT32 );
 
-    return $self->_query_offsets($topic, $partition, $time, $max_number, 0);
+    return $self->_async_query_offsets($topic, $partition, $time, $max_number, 0);
 }
 
-sub _query_offsets {
+sub _async_query_offsets {
     my ( $self, $topic, $partition, $time, $max_number, $api_version ) = @_;
 
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'topic' )
         unless defined( $topic) && ( $topic eq q{} || defined( _STRING( $topic ) ) ) && !utf8::is_utf8( $topic );
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'partition' )
         unless defined( $partition ) && isint( $partition ) && $partition >= 0;
-
-    my $is_v1 = $api_version == 1;
 
     my $request = {
         ApiKey                              => $APIKEY_OFFSET,
@@ -655,28 +671,34 @@ sub _query_offsets {
         ],
     };
 
-    my $response = $self->{Connection}->receive_response_to_request( $request );
+    my $promise = $self->{Connection}->async_receive_response_to_request( $request );
 
-    my $offsets = [];
-    # because we accepted only one topic and partition, we are sure that the
-    # response is all about this single topic and partition, so we can merge
-    # the offsets.
-    if ($is_v1) {
-        foreach my $received_topic ( @{ $response->{topics} } ) {
-            foreach my $partition_offsets ( @{ $received_topic->{PartitionOffsets} } ) {
-                push @$offsets, { timestamp => $partition_offsets->{Timestamp},
-                                  offset    => $partition_offsets->{Offset} };
+    return $promise->then( sub
+    {
+        my ( $response ) = @_;
+
+        my $offsets = [];
+        # because we accepted only one topic and partition, we are sure that the
+        # response is all about this single topic and partition, so we can merge
+        # the offsets.
+        my $is_v1 = $api_version == 1;
+        if ($is_v1) {
+            foreach my $received_topic ( @{ $response->{topics} } ) {
+                foreach my $partition_offsets ( @{ $received_topic->{PartitionOffsets} } ) {
+                    push @$offsets, { timestamp => $partition_offsets->{Timestamp},
+                                      offset    => $partition_offsets->{Offset} };
+                }
+            }
+        } else {
+            foreach my $received_topic ( @{ $response->{topics} } ) {
+                foreach my $partition_offsets ( @{ $received_topic->{PartitionOffsets} } ) {
+                    push @$offsets, @{ $partition_offsets->{Offset} };
+                }
             }
         }
-    } else {
-        foreach my $received_topic ( @{ $response->{topics} } ) {
-            foreach my $partition_offsets ( @{ $received_topic->{PartitionOffsets} } ) {
-                push @$offsets, @{ $partition_offsets->{Offset} };
-            }
-        }
-    }
 
-    return $offsets;
+        return $offsets;
+    } );
 }
 
 =head3 C<commit_offsets( $topic, $partition, $offset, $group )>
@@ -716,7 +738,7 @@ The argument must be a normal non-false string of non-zero length.
 =back
 
 =cut
-sub commit_offsets {
+sub async_commit_offsets {
     my ( $self, $topic, $partition, $offset, $group ) = @_;
 
 
@@ -749,7 +771,7 @@ sub commit_offsets {
         ],
     };
 
-    return $self->{Connection}->receive_response_to_request( $request );
+    return $self->{Connection}->async_receive_response_to_request( $request );
 }
 
 =head3 C<fetch_offsets( $topic, $partition, $group )>
@@ -780,7 +802,7 @@ The argument must be a normal non-false string of non-zero length.
 =back
 
 =cut
-sub fetch_offsets {
+sub async_fetch_offsets {
     my ( $self, $topic, $partition, $group ) = @_;
 
 
@@ -809,7 +831,7 @@ sub fetch_offsets {
         ],
     };
 
-    return $self->{Connection}->receive_response_to_request( $request );
+    return $self->{Connection}->async_receive_response_to_request( $request );
 }
 
 #-- private attributes ---------------------------------------------------------

@@ -23,7 +23,8 @@ our $DEBUG = 0;
 our $VERSION = '1.07';
 
 
-
+use AE;
+use AnyEvent::Handle;
 use Carp;
 use Config;
 use Const::Fast;
@@ -46,6 +47,7 @@ use IO::Select;
 use Params::Util qw(
     _STRING
 );
+use Promises qw(deferred);
 use POSIX qw(
     ceil
 );
@@ -241,7 +243,7 @@ sub new {
     ( $self->{port} ) = $self->{port} =~ /\A(.+)\z/;
 
     $self->{socket}     = undef;
-    $self->{_io_select} = undef;
+    $self->{_ae_handle} = undef;
     my $error;
     try {
         $self->_connect();
@@ -263,6 +265,29 @@ The following methods are provided by C<Kafka::IO> class:
 
 =cut
 
+sub _sync
+{
+    my ( $promise ) = @_;
+    my $cv = AE::cv();
+    my $response;
+    my $error;
+    my $error_received = 0;
+    $promise->then( sub {
+            $response = $_[0];
+            $cv->send();
+        }, sub {
+            $error = $_[0];
+            $error_received = 1;
+            $cv->send();
+        } );
+
+    $cv->recv();
+
+    die $error if $error_received;
+
+    return $response;
+}
+
 =head3 C<< send( $message <, $timeout> ) >>
 
 Sends a C<$message> to Kafka.
@@ -276,6 +301,49 @@ Returns the number of characters sent.
 =cut
 sub send {
     my ( $self, $message, $timeout ) = @_;
+
+    my $len = $self->async_send( $message, $timeout );
+
+    $timeout = $self->{timeout} // $REQUEST_TIMEOUT unless defined $timeout;
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, '->send' )
+        unless $timeout > 0
+    ;
+
+    my $handle = $self->{_ae_handle};
+
+    my $timeout_timer;
+    my $has_timeout;
+    my $cv = AE::cv();
+    $handle->on_drain( sub {
+            my ( $hdl ) = @_;
+            $timeout_timer = undef;
+            $cv->send();
+        } );
+
+    AE::now_update();
+    $timeout_timer = AE::timer $timeout, 0, sub {
+        if ( $timeout_timer ) {
+            $timeout_timer = undef;
+            $has_timeout = 1;
+            $self->close();
+            $cv->send();
+        }
+        return;
+    };
+
+    $cv->recv();
+
+    $timeout_timer = undef;
+    $handle->on_drain( undef );
+
+    return 0 if $has_timeout;
+
+    return $len;
+}
+
+sub async_send {
+    my ( $self, $message, $timeout ) = @_;
+
     $self->_error( $ERROR_MISMATCH_ARGUMENT, '->send' )
         unless defined( _STRING( $message ) )
     ;
@@ -283,105 +351,16 @@ sub send {
     $self->_error( $ERROR_MISMATCH_ARGUMENT, '->send' )
         unless $length <= $MAX_SOCKET_REQUEST_BYTES
     ;
-    $timeout = $self->{timeout} // $REQUEST_TIMEOUT unless defined $timeout;
-    $self->_error( $ERROR_MISMATCH_ARGUMENT, '->receive' )
-        unless $timeout > 0
-    ;
-    my $select = $self->{_io_select};
-    $self->_error( $ERROR_NO_CONNECTION, 'Attempt to work with a closed socket' ) unless $select;
+    my $handle = $self->{_ae_handle};
+    $self->_error( $ERROR_NO_CONNECTION, 'Attempt to work with a closed socket' ) unless $handle;
 
     $self->_debug_msg( $message, 'Request to', 'green' )
         if $self->debug_level >= 2
     ;
-    my $sent = 0;
 
-    my $started = Time::HiRes::time();
-    my $until = $started + $timeout;
+    $handle->push_write( $message );
 
-    my $error_code;
-    my $errno;
-    my $retries = 0;
-    my $interrupts = 0;
-    ATTEMPT: while ( $sent < $length && $retries++ < $MAX_RETRIES ) {
-        my $remaining_time = $until - Time::HiRes::time();
-        last ATTEMPT if $remaining_time <= 0; # timeout expired
-
-        undef $!;
-        my $can_write = $select->can_write( $remaining_time );
-        $errno = $!;
-        if ( $errno ) {
-            if ( $errno == EINTR ) {
-                undef $errno;
-                --$retries; # this attempt does not count
-                ++$interrupts;
-                next ATTEMPT;
-            }
-
-            $self->close;
-
-            last ATTEMPT;
-        }
-
-        if ( $can_write ) {
-            # check for EOF on the first attempt only
-            if ( $retries == 1 && $self->_is_close_wait ) {
-                $self->close;
-                $error_code = $ERROR_NO_CONNECTION;
-                last ATTEMPT;
-            }
-
-            undef $!;
-            my $wrote = CORE::send( $self->{socket}, $message, MSG_DONTWAIT );
-            $errno = $!;
-
-            if( defined $wrote && $wrote > 0 ) {
-                $sent += $wrote;
-                if ( $sent < $length ) {
-                    # remove written data from message
-                    $message = substr( $message, $wrote );
-                }
-            }
-
-            if( $errno ) {
-                if( $errno == EINTR ) {
-                    undef $errno;
-                    --$retries; # this attempt does not count
-                    ++$interrupts;
-                    next ATTEMPT;
-                } elsif (
-                           $errno != EAGAIN
-                        && $errno != EWOULDBLOCK
-                        ## on freebsd, if we got ECONNRESET, it's a timeout from the other side
-                        && !( $errno == ECONNRESET && $^O eq 'freebsd' )
-                    ) {
-                    $self->close;
-                    last ATTEMPT;
-                }
-            }
-
-            last ATTEMPT unless defined $wrote;
-        }
-    }
-
-    unless( !$errno && defined( $sent ) && $sent == $length )
-    {
-        $self->_error(
-            $error_code // $ERROR_CANNOT_SEND,
-            format_message( "Kafka::IO(%s)->send: ERRNO=%s ERROR='%s' (length=%s, sent=%s, timeout=%s, retries=%s, interrupts=%s, secs=%.6f)",
-                $self->{host},
-                ( $errno // 0 ) + 0,
-                ( $errno // '<none>' ) . '',
-                $length,
-                $sent,
-                $timeout,
-                $retries,
-                $interrupts,
-                Time::HiRes::time() - $started,
-            )
-        );
-    }
-
-    return $sent;
+    return length $message;
 }
 
 =head3 C<< receive( $length <, $timeout> ) >>
@@ -395,8 +374,15 @@ Use optional C<$timeout> argument to override default timeout for this call only
 Returns a reference to the received message.
 
 =cut
+
 sub receive {
+    my $self = shift;
+    return _sync( $self->async_receive( @_ ) );
+}
+
+sub async_receive {
     my ( $self, $length, $timeout ) = @_;
+
     $self->_error( $ERROR_MISMATCH_ARGUMENT, '->receive' )
         unless $length > 0
     ;
@@ -404,119 +390,40 @@ sub receive {
     $self->_error( $ERROR_MISMATCH_ARGUMENT, '->receive' )
         unless $timeout > 0
     ;
-    my $select = $self->{_io_select};
-    $self->_error( $ERROR_NO_CONNECTION, 'Attempt to work with a closed socket' ) unless $select;
+    my $handle = $self->{_ae_handle};
+    $self->_error( $ERROR_NO_CONNECTION, 'Attempt to work with a closed socket' ) unless $handle;
 
-    my $message = '';
-    my $len_to_read = $length;
+    my $d = deferred;
 
-    my $started = Time::HiRes::time();
-    my $until = $started + $timeout;
-
-    my $error_code;
-    my $errno;
-    my $retries = 0;
-    my $interrupts = 0;
-    ATTEMPT: while ( $len_to_read > 0 && $retries++ < $MAX_RETRIES ) {
-        my $remaining_time = $until - Time::HiRes::time();
-        last if $remaining_time <= 0; # timeout expired
-
-        undef $!;
-        my $can_read = $select->can_read( $remaining_time );
-        $errno = $!;
-        if ( $errno ) {
-            if ( $errno == EINTR ) {
-                undef $errno;
-                --$retries; # this attempt does not count
-                ++$interrupts;
-                next ATTEMPT;
-            }
-
-            $self->close;
-
-            last ATTEMPT;
-        }
-
-        if ( $can_read ) {
-            my $buf = '';
-            undef $!;
-            my $from_recv = CORE::recv( $self->{socket}, $buf, $len_to_read, MSG_DONTWAIT );
-            $errno = $!;
-
-            if ( defined( $from_recv ) && length( $buf ) ) {
-                $message .= $buf;
-                $len_to_read = $length - length( $message );
-                --$retries; # this attempt was successful, don't count as a retry
-            }
-            if ( $errno ) {
-                if ( $errno == EINTR ) {
-                    undef $errno;
-                    --$retries; # this attempt does not count
-                    ++$interrupts;
-                    next ATTEMPT;
-                } elsif (
-                           $errno != EAGAIN
-                        && $errno != EWOULDBLOCK
-                        ## on freebsd, if we got ECONNRESET, it's a timeout from the other side
-                        && !( $errno == ECONNRESET && $^O eq 'freebsd' )
-                    ) {
-                    $self->close;
-                    last ATTEMPT;
-                }
-            }
-
-            if ( length( $buf ) == 0 ) {
-                if( defined( $from_recv ) && ! $errno ) {
-                    # no error and nothing received with select returning "can read" means EOF: other side closed socket
-                    $self->_debug_msg( 'EOF on receive attempt, closing socket' )
-                        if $self->debug_level;
-                    $self->close;
-
-                    if( length( $message ) == 0 ) {
-                        # we did not receive anything yet, so we may (in some cases) reconnect and try again
-                        $error_code = $ERROR_NO_CONNECTION;
-                    }
-
-                    last ATTEMPT;
-                }
-                # we did not read anything on this attempt: wait a bit before the next one; should not happen, but just in case...
-                if ( my $remaining_attempts = $MAX_RETRIES - $retries ) {
-                    $remaining_time = $until - Time::HiRes::time();
-                    my $micro_seconds = int( $remaining_time * 1e6 / $remaining_attempts );
-                    if ( $micro_seconds > 0 ) {
-                        $micro_seconds = 250_000 if $micro_seconds > 250_000; # prevent long sleeps if total remaining time is big
-                        $self->_debug_msg( format_message( 'sleeping (remaining attempts %d, time %.6f): %d microseconds', $remaining_attempts, $remaining_time, $micro_seconds ) )
-                            if $self->debug_level;
-                        Time::HiRes::usleep( $micro_seconds );
-                    }
-                }
-            }
-        }
-    }
-
-    unless( !$errno && length( $message ) >= $length )
+    my $timeout_timer = 1;
+    $handle->push_read( chunk => $length, sub
     {
-        $self->_error(
-            $error_code // $ERROR_CANNOT_RECV,
-            format_message( "Kafka::IO(%s)->receive: ERRNO=%s ERROR='%s' (length=%s, received=%s, timeout=%s, retries=%s, interrupts=%s, secs=%.6f)",
-                $self->{host},
-                ( $errno // 0 ) + 0,
-                ( $errno // '<none>' ) . '',
-                $length,
-                length( $message ),
-                $timeout,
-                $retries,
-                $interrupts,
-                Time::HiRes::time() - $started,
-            ),
-        );
-    }
-    $self->_debug_msg( $message, 'Response from', 'yellow' )
-        if $self->debug_level >= 2;
+        my ( $hdl, $response ) = @_;
+        if ( $d->is_done ) {
+            print STDERR "Ignoring response\n";
+        } else {
+            $timeout_timer = undef;
+            $d->resolve( \$response );
+        }
+        return;
+    } );
 
-    # returns tainted data
-    return \$message;
+    # I tried to use (r)timeout of AnyEvent::Handle, but that does
+    # not seem to work as expected. The timer is often called immediately,
+    # but sometimes not at all.
+    AE::now_update();
+    $timeout_timer = AE::timer $timeout, 0, sub {
+        return if $d->is_done;
+        $timeout_timer = undef;
+        $self->close();
+        # $self->_error( $ERROR_CANNOT_RECV, "timed out" );
+        $d->reject( "timed out" );
+        return;
+    };
+
+    return $d->promise;
 }
+
 
 =head3 C<close>
 
@@ -531,23 +438,10 @@ sub close {
     if ( $self->{socket} ) {
         $ret = CORE::close( $self->{socket} );
         $self->{socket}     = undef;
-        $self->{_io_select} = undef;
+        $self->{_ae_handle} = undef;
     }
 
     return $ret;
-}
-
-sub _is_close_wait {
-    my ( $self ) = @_;
-    return 1 unless $self->{socket} && $self->{_io_select}; # closed already
-    # http://stefan.buettcher.org/cs/conn_closed.html
-    # socket is open; check if we can read, and if we can but recv() cannot peek, it means we got EOF
-    return unless $self->{_io_select}->can_read( 0 ); # we cannot read, but may be able to write
-    my $buf = '';
-    undef $!;
-    my $status = CORE::recv( $self->{socket}, $buf, 1, MSG_DONTWAIT | MSG_PEEK ); # peek, do not remove data from queue
-    # EOF when there is no error, status is defined, but result is empty
-    return ! $! && defined $status && length( $buf ) == 0;
 }
 
 # The method verifies if we can connect to a Kafka broker.
@@ -575,7 +469,7 @@ sub _connect {
     my ( $self ) = @_;
 
     $self->{socket}     = undef;
-    $self->{_io_select} = undef;
+    $self->{_ae_handle} = undef;
 
     my $name    = $self->{host};
     my $port    = $self->{port};
@@ -694,8 +588,9 @@ sub _connect {
     setsockopt( $connection, SOL_SOCKET, SO_RCVTIMEO, $timeval ) // die "setsockopt SOL_SOCKET, SO_RCVTIMEO: $!\n";
 
     $self->{socket} = $connection;
-    my $s = $self->{_io_select} = IO::Select->new;
-    $s->add( $self->{socket} );
+    $self->{_ae_handle} = AnyEvent::Handle->new(
+        fh => $connection,
+    );
 
     return $connection;
 }

@@ -315,6 +315,10 @@ Do not use C<$Kafka::SEND_MAX_ATTEMPTS> in C<Kafka::Producer-<gt>send> request t
 
 =cut
 sub send {
+    my $self = shift;
+    return Kafka::IO::_sync( $self->async_send( @_ ) );
+}
+sub async_send {
     my ( $self, $topic, $partition, $messages, $keys, $compression_codec, $timestamps ) = @_;
 
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'topic' )
@@ -411,8 +415,7 @@ sub send {
         ++$key_index;
     }
 
-    my $result = $self->{Connection}->receive_response_to_request( $request, $compression_codec, $self->{Timeout} );
-    return $result;
+    return $self->{Connection}->async_receive_response_to_request( $request, $compression_codec, $self->{Timeout} );
 }
 
 #-- private attributes ---------------------------------------------------------

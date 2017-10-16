@@ -131,6 +131,8 @@ const our $KAFKA_MOCK_HOSTNAME      => 'localhost';
 my %_reinstall = (
     new                         => [ \&Kafka::IO::new,      \&new ],
     send                        => [ \&Kafka::IO::send,     \&send ],
+    async_send                  => [ \&Kafka::IO::async_send,    \&async_send ],
+    async_receive               => [ \&Kafka::IO::async_receive, \&async_receive ],
     receive                     => [ \&Kafka::IO::receive,  \&receive ],
     close                       => [ \&Kafka::IO::close,    \&close ],
     _is_alive                   => [ \&Kafka::IO::_is_alive, \&_is_alive ],
@@ -435,6 +437,12 @@ The following methods are defined for the C<Kafka::MockIO> class:
 Method emulation (C<Kafka::IO::send>).
 
 =cut
+sub async_send {
+    my $self = shift;
+    my $d = Promises::deferred();
+    $d->resolve( $self->send( @_ ) );
+    return $d;
+}
 sub send {
     my ( $self, $message ) = @_;
 
@@ -609,6 +617,12 @@ sub send {
 Method emulation (C<Kafka::IO::receive>).
 
 =cut
+sub async_receive {
+    my $self = shift;
+    my $d = Promises::deferred();
+    $d->resolve( $self->receive( @_ ) );
+    return $d;
+}
 sub receive {
     my ( $self, $length ) = @_;
 

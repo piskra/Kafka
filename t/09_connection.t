@@ -370,6 +370,7 @@ sub communication_error {
     $port = $Kafka::MockIO::KAFKA_MOCK_SERVER_PORT;
     Kafka::MockIO::override();
     my $method = \&Kafka::IO::send;
+    my $method_async = \&Kafka::IO::async_send;
 
     our $_attempt;
     Sub::Install::reinstall_sub( {
@@ -383,6 +384,19 @@ sub communication_error {
         },
         into    => 'Kafka::IO',
         as      => 'send',
+    } );
+
+    Sub::Install::reinstall_sub( {
+        code    => sub {
+            my ( $self ) = @_;
+            if ( $main::_attempt++ ) {
+                $self->_error( $ERROR_CANNOT_SEND );
+            } else {
+                return &$method_async( @_ );
+            }
+        },
+        into    => 'Kafka::IO',
+        as      => 'async_send',
     } );
 
     $connect = Kafka::Connection->new(
@@ -403,10 +417,16 @@ sub communication_error {
         into    => 'Kafka::IO',
         as      => 'send',
     } );
+    Sub::Install::reinstall_sub( {
+        code    => $method_async,
+        into    => 'Kafka::IO',
+        as      => 'async_send',
+    } );
 
     #-- $ERROR_RESPONSEMESSAGE_NOT_RECEIVED
 
     $method = \&Kafka::IO::receive;
+    $method_async = \&Kafka::IO::async_receive;
 
     Sub::Install::reinstall_sub( {
         code    => sub {
@@ -422,6 +442,21 @@ sub communication_error {
         into    => 'Kafka::IO',
         as      => 'receive',
     } );
+    Sub::Install::reinstall_sub( {
+        code    => sub {
+            my ( $self, $length ) = @_;
+            my $only_MessageSize;
+            if ( $length == 4 ) {
+                $only_MessageSize = pack( q{l>}, 0 );
+            } else {
+                $only_MessageSize = q{};
+            }
+            return Kafka::Connection::_promise_resolved( \$only_MessageSize );
+        },
+        into    => 'Kafka::IO',
+        as      => 'async_receive',
+    } );
+
 
     $request = {
         ApiKey                              => $APIKEY_FETCH,
@@ -451,6 +486,11 @@ sub communication_error {
         code    => $method,
         into    => 'Kafka::IO',
         as      => 'receive',
+    } );
+    Sub::Install::reinstall_sub( {
+        code    => $method_async,
+        into    => 'Kafka::IO',
+        as      => 'async_receive',
     } );
 
     Kafka::MockIO::restore();
