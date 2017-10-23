@@ -234,6 +234,8 @@ sub new {
         af          => '',  # Address family constant
         pf          => '',  # Protocol family constant
         ip          => '',  # Human-readable textual representation of the ip address
+        in_use      => 0,
+        server      => '',  # Remember the name, so we will be able to find the server from the io
     }, $class;
 
     exists $p{$_} and $self->{$_} = $p{$_} foreach keys %$self;
@@ -242,19 +244,18 @@ sub new {
     ( $self->{host} ) = $self->{host} =~ /\A(.+)\z/;
     ( $self->{port} ) = $self->{port} =~ /\A(.+)\z/;
 
+    print STDERR "New connection to $self->{host}:$self->{port}\n";
+
     $self->{socket}     = undef;
     $self->{_ae_handle} = undef;
-    my $error;
-    try {
-        $self->_connect();
-    } catch {
-        $error = $_;
-    };
 
-    $self->_error( $ERROR_CANNOT_BIND, format_message("Kafka::IO(%s:%s)->new: %s", $self->{host}, $self->{port}, $error ) )
-        if defined $error
-    ;
     return $self;
+}
+
+sub DESTROY
+{
+    my ( $self ) = @_;
+    print STDERR "DESTROYing connection to $self->{host}:$self->{port}\n";
 }
 
 #-- public attributes ----------------------------------------------------------
@@ -424,6 +425,15 @@ sub async_receive {
     return $d->promise;
 }
 
+sub available {
+    my $self = shift;
+    return !$self->{in_use};
+}
+
+sub set_in_use {
+    my ( $self, $flag ) = @_;
+    $self->{in_use} = $flag;
+}
 
 =head3 C<close>
 
@@ -434,6 +444,7 @@ Returns true if those operations succeed and if no error was reported by any Per
 sub close {
     my ( $self ) = @_;
 
+    $self->set_in_use( 0 );
     my $ret = 1;
     if ( $self->{socket} ) {
         $ret = CORE::close( $self->{socket} );
@@ -453,7 +464,7 @@ sub _is_alive {
     return unless $socket;
 
     socket( my $tmp_socket, $self->{pf}, SOCK_STREAM, IPPROTO_TCP );
-    my $is_alive = connect( $tmp_socket, getpeername( $socket ) );
+    my $is_alive = CORE::connect( $tmp_socket, getpeername( $socket ) );
     CORE::close( $tmp_socket );
 
     return $is_alive;
@@ -465,6 +476,26 @@ sub _is_alive {
 
 # You need to have access to Kafka instance and be able to connect through TCP.
 # uses http://devpit.org/wiki/Connect%28%29_with_timeout_%28in_Perl%29
+sub connect {
+    my ( $self ) = @_;
+
+    return if $self->{socket};
+    $self->set_error( undef );
+
+    my $error;
+    try {
+        $self->_connect();
+    } catch {
+        $error = $_;
+    };
+
+    $self->_error( $ERROR_CANNOT_BIND, format_message("Kafka::IO(%s:%s)->connect: %s", $self->{host}, $self->{port}, $error ) )
+        if defined $error
+    ;
+
+    return $self;
+}
+
 sub _connect {
     my ( $self ) = @_;
 
@@ -552,7 +583,7 @@ sub _connect {
         ? pack_sockaddr_in(  $port, inet_aton( $ip ) )
         : pack_sockaddr_in6( $port, inet_pton( $self->{af}, $ip ) )
     ;
-    connect( $connection, $sockaddr ) || $!{EINPROGRESS} || die( format_message( "connect ip = %s, port = %s: %s\n", $ip, $port, $! ) );
+    CORE::connect( $connection, $sockaddr ) || $!{EINPROGRESS} || die( format_message( "connect ip = %s, port = %s: %s\n", $ip, $port, $! ) );
 
     # Reset O_NONBLOCK.
     $flags = fcntl( $connection, F_GETFL, 0 ) or die "fcntl F_GETFL: $!\n";  # 0 for error, 0e0 for 0.
@@ -764,7 +795,17 @@ sub _error {
     Kafka::Exception::IO->throw( %args );
 }
 
+sub set_error
+{
+    my ( $self, $error ) = @_;
+    $self->{last_error} = $error;
+}
 
+sub last_error
+{
+    my $self = shift;
+    return $self->{last_error};
+}
 
 1;
 

@@ -505,7 +505,7 @@ sub new {
         my $correct_server = $self->_build_server_name( $host, $port );
         $IO_cache->{ $correct_server } = {
             NodeId  => undef,
-            IO      => undef,
+            IO      => [],
             host    => $host,
             port    => $port,
         };
@@ -622,15 +622,8 @@ sub _get_supported_api_versions {
 
     my $encoded_response_ref;
 
-    # receive apiversions. We use a code block because it's actually a loop where
-    # you can do last.
-    {
-        $self->_connectIO( $broker )
-          or last;
-        my $sent = $self->_sendIO( $broker, $encoded_request )
-          or last;
-        $encoded_response_ref = $self->_receiveIO( $broker );
-    }
+    # receive apiversions
+    $encoded_response_ref = $self->_receive_data_from_some_broker( [ $broker ], $encoded_request );
 
     unless ( $encoded_response_ref ) {
         # NOTE: it is possible to repeat the operation here
@@ -732,10 +725,6 @@ sub _is_server_alive {
     $self->_error( $ERROR_NO_KNOWN_BROKERS, 'has not yet received the metadata?' )
         unless $self->get_known_servers;
 
-    my $io_cache = $self->{_IO_cache};
-    $self->_error( $ERROR_MISMATCH_ARGUMENT, format_message( "Unknown server '%s' (is not found in the metadata)", $server ) )
-        unless exists( $io_cache->{ $server } );
-
     if ( my $io = $self->_connectIO( $server ) ) {
         return $io->_is_alive;
     } else {
@@ -755,6 +744,8 @@ sub _is_server_connected {
     unless ( exists( $io_cache->{ $server } ) && ( $io = $io_cache->{ $server }->{IO} ) ) {
         return;
     }
+    $io = $io->[0]
+        or return;
 
     return $io->_is_alive;
 }
@@ -839,10 +830,6 @@ sub receive_response_to_request {
 sub async_receive_response_to_request {
     my ( $self, $request, $compression_codec, $response_timeout ) = @_;
 
-    $self->_error( $ERROR_RESPONSEMESSAGE_NOT_RECEIVED, "Connection is already in use", request => $request )
-        if $self->{__active};
-    $self->{__active} = 1;
-
     my $api_key = $request->{ApiKey};
 
     my $host_to_send_to = $request->{__send_to__} // 'leader';
@@ -895,7 +882,6 @@ sub async_receive_response_to_request {
                 $ErrorCode == $ERROR_NO_ERROR ? 'refreshing metadata' : "ErrorCode ${ErrorCode}",
             ) if $self->debug_level;
 
-        $self->{__active} = 1;
         return _delay( $self->{RETRY_BACKOFF} / 1000 )->then( sub
         {
             $self->_update_metadata( $topic_name )
@@ -944,7 +930,8 @@ sub async_receive_response_to_request {
         }
 
         # Send a request to the server
-        if ( $self->_connectIO( $server ) ) {
+        my $io;
+        if ( $io = $self->_connectIO( $server ) ) {
             # we can connect to this server, so let's detect the api versions
             # it and use whatever it supports, except if the request forces us
             # to use an api version. Warning, the version might end up being
@@ -963,20 +950,20 @@ sub async_receive_response_to_request {
 
             my $encoded_request = $protocol{ $api_key }->{encode}->( $request, $compression_codec );
 
-            unless ( $self->_sendIO( $server, $encoded_request ) ) {
-                $io_error = $self->_io_error( $server );
+            unless ( $self->_sendIO( $io, $encoded_request ) ) {
+                $io_error = $io->last_error;
                 $ErrorCode = $io_error ? $io_error->code : $ERROR_CANNOT_SEND;
-                $self->_closeIO( $server, 1 );
+                $io->close;
             }
         }
         else {
-            $io_error = $self->_io_error( $server );
+            $io_error = $io->last_error;
             $ErrorCode = $io_error ? $io_error->code : $ERROR_CANNOT_BIND;
         }
 
         if ( $ErrorCode != $ERROR_NO_ERROR ) {
             # could not send request due to non-fatal IO error (fatal errors should be thrown by connectIO/sendIO already)
-            $self->_remember_nonfatal_error( $ErrorCode, $self->_io_error( $server ), $server, $topic_name, $partition );
+            $self->_remember_nonfatal_error( $ErrorCode, $io->last_error, $server, $topic_name, $partition );
             if( $api_key == $APIKEY_PRODUCE && !( $ErrorCode == $ERROR_CANNOT_BIND || $ErrorCode == $ERROR_NO_CONNECTION ) ) {
                 # do not retry failed produce requests which may have sent some data already
                 $ErrorCode = $ERROR_CANNOT_SEND;
@@ -1005,7 +992,7 @@ sub async_receive_response_to_request {
             };
             $promise = _promise_resolved( $response );
         } else {
-            $promise = $self->_async_receiveIO( $server, $response_timeout )->then( sub
+            $promise = $self->_async_receiveIO( $io, $response_timeout )->then( sub
             {
                 my ( $encoded_response_ref ) = @_;
                 unless ( $encoded_response_ref ) {
@@ -1016,10 +1003,10 @@ sub async_receive_response_to_request {
 
                         # Should not be allowed to re-send data on the next attempt
                         # FATAL error
-                        $self->_error( $ErrorCode, "no ack for request", io_error => $self->_io_error( $server ), request => $request );
+                        $self->_error( $ErrorCode, "no ack for request", io_error => $io->last_error, request => $request );
                     } else {
                         $ErrorCode = $ERROR_CANNOT_RECV;
-                        $self->_remember_nonfatal_error( $ErrorCode, $self->_io_error( $server ), $server, $topic_name, $partition );
+                        $self->_remember_nonfatal_error( $ErrorCode, $io->last_error, $server, $topic_name, $partition );
                         return $retry_cb->();
                     }
                 }
@@ -1033,7 +1020,7 @@ sub async_receive_response_to_request {
                             $response,
                         ) if $self->debug_level;
                 } else {
-                    $self->_error( $ERROR_RESPONSEMESSAGE_NOT_RECEIVED, format_message("response length=%s", length( $$encoded_response_ref ) ), io_error => $self->_io_error( $server ), request => $request );
+                    $self->_error( $ERROR_RESPONSEMESSAGE_NOT_RECEIVED, format_message("response length=%s", length( $$encoded_response_ref ) ), io_error => $io->last_error, request => $request );
                 }
 
                 return $response;
@@ -1052,7 +1039,6 @@ sub async_receive_response_to_request {
 
             $ErrorCode = $partition_data->{ErrorCode};
 
-            delete $self->{__active};
             return $response if $ErrorCode == $ERROR_NO_ERROR; # success
 
             if( $api_key == $APIKEY_PRODUCE && $ErrorCode == $ERROR_REQUEST_TIMED_OUT ) {
@@ -1073,11 +1059,9 @@ sub async_receive_response_to_request {
     };
 
     return $main_try_cb->()->then( sub {
-            delete $self->{__active};
             return @_;
         }, sub {
             my $error = $_[0];
-            delete $self->{__active};
 
             if ( $error and $error ne "giving up\n" ) {
                 die $error;
@@ -1140,7 +1124,7 @@ sub close_connection {
         return;
     }
 
-    $self->_closeIO( $server );
+    $self->_close_allIO( $server );
     return 1;
 }
 
@@ -1153,7 +1137,7 @@ sub close {
     my ( $self ) = @_;
 
     foreach my $server ( $self->get_known_servers ) {
-        $self->_closeIO( $server );
+        $self->_close_allIO( $server );
     }
 
     return;
@@ -1174,8 +1158,12 @@ sub cluster_errors {
 
     my %errors;
     foreach my $server ( $self->get_known_servers ) {
-        if ( my $error = $self->_io_error( $server ) ) {
-            $errors{ $server } = $error;
+        my $ios = $self->_server_IO_all( $server )
+            or next;
+        foreach my $io ( @$ios ) {
+            if ( my $error = $io->last_error ) {
+                $errors{ $server } = $error;
+            }
         }
     }
 
@@ -1282,7 +1270,8 @@ sub _get_interviewed_servers {
     foreach my $server ( $self->get_known_servers ) {
         $server_data = $IO_cache->{ $server };
         if ( defined $server_data->{NodeId} ) {
-            if ( $server_data->{IO} ) {
+            my $ios = $server_data->{IO};
+            if ( $ios and @$ios ) {
                 push @priority, $server;
             } else {
                 push @secondary, $server;
@@ -1316,11 +1305,7 @@ sub _update_group_coordinators {
     my @brokers = $self->_get_interviewed_servers;
 
     # receive coordinator data
-    foreach my $broker ( @brokers ) {
-        last if  $self->_connectIO( $broker )
-            &&   $self->_sendIO( $broker, $encoded_request )
-            && ( $encoded_response_ref = $self->_receiveIO( $broker ) );
-    }
+    $encoded_response_ref = $self->_receive_data_from_some_broker( \@brokers, $encoded_request );
 
     unless ( $encoded_response_ref ) {
         # NOTE: it is possible to repeat the operation here
@@ -1340,15 +1325,31 @@ sub _update_group_coordinators {
 
     my $IO_cache = $self->{_IO_cache};
     my $server = $self->_build_server_name( @{ $decoded_response }{ 'Host', 'Port' } );
-        $IO_cache->{ $server } = {                      # can add new servers
-            IO      => $IO_cache->{ $server }->{IO},    # IO or undef
-            NodeId  => $decoded_response->{NodeId},
-            host    => $decoded_response->{Host},
-            port    => $decoded_response->{Port},
-        };
+    $IO_cache->{ $server } = {                      # can add new servers
+        IO      => $IO_cache->{ $server }->{IO},    # [ IO1, IO2, ... ] - may be empty
+        NodeId  => $decoded_response->{NodeId},
+        host    => $decoded_response->{Host},
+        port    => $decoded_response->{Port},
+    };
     $self->{_group_coordinators}->{ $group_id } = $server;
 
     return 1;
+}
+
+sub _receive_data_from_some_broker
+{
+    my ( $self, $brokers, $encoded_request ) = @_;
+
+    my $encoded_response_ref;
+    foreach my $broker ( @$brokers ) {
+        my $io = $self->_connectIO( $broker )
+            or next;
+        my $sent = $self->_sendIO( $io, $encoded_request )
+            or next;
+        last if ( $encoded_response_ref = $self->_receiveIO( $io ) );
+    }
+
+    return $encoded_response_ref
 }
 
 # Refresh metadata for given topic
@@ -1373,11 +1374,7 @@ sub _update_metadata {
     my @brokers = $self->_get_interviewed_servers;
 
     # receive metadata
-    foreach my $broker ( @brokers ) {
-        last if  $self->_connectIO( $broker )
-            &&   $self->_sendIO( $broker, $encoded_request )
-            && ( $encoded_response_ref = $self->_receiveIO( $broker ) );
-    }
+    $encoded_response_ref = $self->_receive_data_from_some_broker( \@brokers, $encoded_request );
 
     unless ( $encoded_response_ref ) {
         # NOTE: it is possible to repeat the operation here
@@ -1411,7 +1408,7 @@ sub _update_metadata {
     foreach my $received_broker ( @{ $decoded_response->{Broker} } ) {
         my $server = $self->_build_server_name( @{ $received_broker }{ 'Host', 'Port' } );
         $IO_cache->{ $server } = {                      # can add new servers
-            IO      => $IO_cache->{ $server }->{IO},    # IO or undef
+            IO      => $IO_cache->{ $server }->{IO},    # [ IO1, IO2, ... ] -- may be empty
             NodeId  => $received_broker->{NodeId},
             host    => $received_broker->{Host},
             port    => $received_broker->{Port},
@@ -1499,12 +1496,10 @@ sub _build_server_name {
 
 # remembers error communicating with the server
 sub _on_io_error {
-    my ( $self, $server_data, $error ) = @_;
-    $server_data->{error} = $error;
-    if( $server_data->{IO} ) {
-        $server_data->{IO}->close;
-        $server_data->{IO} = undef;
-    }
+    my ( $self, $io, $error ) = @_;
+
+    $io->set_error( $error );
+    $io->close;
 
     if( blessed( $error ) && $error->isa('Kafka::Exception') ) {
         if( $error->code == $ERROR_MISMATCH_ARGUMENT || $error->code == $ERROR_INCOMPATIBLE_HOST_IP_VERSION ) {
@@ -1521,19 +1516,15 @@ sub _on_io_error {
     return;
 }
 
-sub _io_error {
-    my( $self, $server ) = @_;
-    my $error;
-    if( my $server_data = $self->{_IO_cache}->{ $server } ) {
-        $error = $server_data->{error};
-    }
-    return $error;
+sub _server_IO_all {
+    my ( $self, $server ) = @_;
+    my $server_data = $self->{_IO_cache}->{ $server } or return;
+    return $server_data->{IO};
 }
 
 sub _is_IO_connected {
     my ( $self, $server ) = @_;
-    my $server_data = $self->{_IO_cache}->{ $server } or return;
-    return $server_data->{IO};
+    return !!$self->_server_IO_all( $server );
 }
 
 # connects to a server (host:port or [IPv6_host]:port)
@@ -1543,46 +1534,42 @@ sub _connectIO {
     my $server_data = $self->{_IO_cache}->{ $server }
         or $self->_error( $ERROR_MISMATCH_ARGUMENT, format_message( "Unknown server '%s' (is not found in the metadata)", $server ) )
     ;
-    unless( $server_data->{IO} ) {
-        my $error;
-        try {
-            $server_data->{IO} = Kafka::IO->new(
-                host        => $server_data->{host},
-                port        => $server_data->{port},
-                timeout     => $self->{timeout},
-                ip_version  => $self->{ip_version},
-            );
-            $server_data->{error} = undef;
-        } catch {
-            $error = $_;
-        };
 
-        if( defined $error ) {
-            $self->_on_io_error( $server_data, $error );
-            return;
-        }
+    my $all_io = $server_data->{IO} //= [];
+    my ( $this_io ) = grep $_->available, @$all_io;
+
+    unless ( $this_io ) {
+        $this_io = Kafka::IO->new(
+            host        => $server_data->{host},
+            port        => $server_data->{port},
+            timeout     => $self->{timeout},
+            ip_version  => $self->{ip_version},
+            server      => $server,
+        );
+        push @$all_io, $this_io;
+    }
+    my $error;
+    try {
+        $this_io->connect();
+    } catch {
+        $error = $_;
+    };
+
+    if( defined $error ) {
+        $self->_on_io_error( $this_io, $error );
+        return;
     }
 
-    return $server_data->{IO};
-}
-
-sub _server_data_IO {
-    my ( $self, $server ) = @_;
-    my $server_data = $self->{_IO_cache}->{ $server }
-        or $self->_error( $ERROR_MISMATCH_ARGUMENT, format_message( "Unknown server '%s' (is not found in the metadata)", $server ) )
-    ;
-    $self->_error( $ERROR_MISMATCH_ARGUMENT, format_message( "Server '%s' is not connected", $server ) )
-        unless $server_data->{IO}
-    ;
-    return ( $server_data, $server_data->{IO} );
+    return $this_io;
 }
 
 # Send encoded request ($encoded_request) to server ($server)
 sub _sendIO {
-    my ( $self, $server, $encoded_request ) = @_;
-    my( $server_data, $io ) = $self->_server_data_IO( $server );
+    my ( $self, $io, $encoded_request, $not_mark_in_use ) = @_;
     my $sent;
     my $error;
+    Carp::confess "IO already in use" unless $io->available;
+    $io->set_in_use( 1 ) unless $not_mark_in_use;
     try {
         $sent = $io->send( $encoded_request );
     } catch {
@@ -1590,7 +1577,7 @@ sub _sendIO {
     };
 
     if( defined $error ) {
-        $self->_on_io_error( $server_data, $error );
+        $self->_on_io_error( $io, $error );
     }
 
     return $sent;
@@ -1603,8 +1590,8 @@ sub _receiveIO {
 }
 
 sub _async_receiveIO {
-    my ( $self, $server, $response_timeout ) = @_;
-    my( $server_data, $io ) = $self->_server_data_IO( $server );
+    my ( $self, $io, $response_timeout, $not_unmark_in_use ) = @_;
+
     my $response_ref;
     my $error;
 
@@ -1619,31 +1606,32 @@ sub _async_receiveIO {
         } )->then(
         sub {
             my ( $message_body_ref ) = @_;
+            $io->set_in_use( 0 )
+                unless $not_unmark_in_use;
             $$size_response_ref .= $$message_body_ref;
             return $size_response_ref;
         }, sub {
             my ( $error ) = @_;
             if( defined $error ) {
-                $self->_on_io_error( $server_data, $error );
+                $self->_on_io_error( $io, $error );
             }
         } );
 }
 
 
 # Close connectino to $server
-sub _closeIO {
-    my ( $self, $server, $keep_error ) = @_;
+sub _close_allIO {
+    my ( $self, $server ) = @_;
 
-    if ( my $server_data = $self->{_IO_cache}->{ $server } ) {
-        if ( my $io = $server_data->{IO} ) {
-            $io->close;
-            $server_data->{error} = undef unless $keep_error;
-            $server_data->{IO}    = undef;
-        }
-    }
+    my $server_data = $self->{_IO_cache}->{ $server }
+        or return;
+
+    my $all_io = $server_data->{IO};
+    $_->close foreach @$all_io;
 
     return;
 }
+
 
 # check validity of an argument to match host:port format
 sub _is_like_server {

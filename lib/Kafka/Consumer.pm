@@ -329,29 +329,41 @@ can be imported from L<Kafka|Kafka> module.
 
 =cut
 sub fetch {
-    my $self = shift;
-    return Kafka::IO::_sync( $self->async_fetch( @_ ) );
+    my ( $self, $topic, $partition, $start_offset, $max_size, $_return_all, $api_version ) = @_;
+    return Kafka::IO::_sync( $self->async_fetch(
+            Topic => $topic,
+            Partition => $partition,
+            FetchOffset => $start_offset,
+            MaxBytes => $max_size,
+            # Special argument: _return_all - return redundant messages sent out of a compressed package posts
+            _return_all => $_return_all,
+            ApiVersion => $api_version,
+        ) );
 }
 
 sub async_fetch {
-    my ( $self, $topic, $partition, $start_offset, $max_size, $_return_all, $api_version ) = @_;
-    # Special argument: $_return_all - return redundant messages sent out of a compressed package posts
+    my ( $self, %args ) = @_;
 
-    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'topic' )
+    my $topic = delete $args{Topic};
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'Topic' )
         unless defined( $topic ) && ( $topic eq q{} || defined( _STRING( $topic ) ) ) && !utf8::is_utf8( $topic );
-    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'partition' )
+    my $partition = delete $args{Partition};
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'Partition' )
         unless defined( $partition ) && isint( $partition ) && $partition >= 0;
-    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'offset' )
+    my $start_offset = delete $args{FetchOffset};
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, 'FetchOffset' )
         unless defined( $start_offset ) && ( ( _isbig( $start_offset ) && $start_offset >= 0 ) || defined( _NONNEGINT( $start_offset ) ) );
-    $self->_error( $ERROR_MISMATCH_ARGUMENT, format_message( 'max_size (%s)', $max_size ) )
+    my $max_size = delete $args{MaxBytes};
+    $self->_error( $ERROR_MISMATCH_ARGUMENT, format_message( 'MaxBytes (%s)', $max_size ) )
         unless ( !defined( $max_size ) || ( ( _isbig( $max_size ) || _POSINT( $max_size ) ) && $max_size >= $MESSAGE_SIZE_OVERHEAD && $max_size <= $MAX_INT32 ) );
 
+    my $max_wait_time = $args{MaxWaitTime} // $self->{MaxWaitTime};
     my $request = {
         ApiKey                              => $APIKEY_FETCH,
-        ApiVersion                          => $api_version // $self->{ApiVersion},
+        ApiVersion                          => $args{ApiVersion} // $self->{ApiVersion},
         CorrelationId                       => _get_CorrelationId(),
         ClientId                            => $self->{ClientId},
-        MaxWaitTime                         => int( $self->{MaxWaitTime} * 1000 ),
+        MaxWaitTime                         => int( $max_wait_time * 1000 ),
         MinBytes                            => $self->{MinBytes},
         MaxBytes                            => $max_size // $self->{MaxBytes},
         topics                              => [
@@ -368,10 +380,10 @@ sub async_fetch {
         ],
     };
 
-    my $promise = $self->{Connection}->async_receive_response_to_request( $request, undef, $self->{MaxWaitTime} );
+    my $promise = $self->{Connection}->async_receive_response_to_request( $request, undef, $max_wait_time );
 
     return $promise->then( sub {
-            return $self->_fetch_process_response( $_[0], $topic, $partition, $start_offset, $max_size, $_return_all, $api_version );
+            return $self->_fetch_process_response( $_[0], $topic, $partition, $start_offset, $max_size, $args{_return_all}, $args{ApiVersion} );
         } );
 }
 
