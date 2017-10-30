@@ -266,29 +266,6 @@ The following methods are provided by C<Kafka::IO> class:
 
 =cut
 
-sub _sync
-{
-    my ( $promise ) = @_;
-    my $cv = AE::cv();
-    my $response;
-    my $error;
-    my $error_received = 0;
-    $promise->then( sub {
-            $response = $_[0];
-            $cv->send();
-        }, sub {
-            $error = $_[0];
-            $error_received = 1;
-            $cv->send();
-        } );
-
-    $cv->recv();
-
-    die $error if $error_received;
-
-    return $response;
-}
-
 =head3 C<< send( $message <, $timeout> ) >>
 
 Sends a C<$message> to Kafka.
@@ -378,7 +355,7 @@ Returns a reference to the received message.
 
 sub receive {
     my $self = shift;
-    return _sync( $self->async_receive( @_ ) );
+    return promise_wait( $self->async_receive( @_ ) );
 }
 
 sub async_receive {

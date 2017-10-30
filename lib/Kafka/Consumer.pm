@@ -57,6 +57,9 @@ use Kafka::Internals qw(
 );
 use Kafka::Connection;
 use Kafka::Message;
+use Kafka::Promises qw(
+    promise_wait
+);
 
 if ( !$BITS64 ) { eval 'use Kafka::Int64; 1;' or die "Cannot load Kafka::Int64 : $@"; } ## no critic
 
@@ -330,7 +333,7 @@ can be imported from L<Kafka|Kafka> module.
 =cut
 sub fetch {
     my ( $self, $topic, $partition, $start_offset, $max_size, $_return_all, $api_version ) = @_;
-    return Kafka::IO::_sync( $self->async_fetch(
+    return promise_wait( $self->async_fetch(
             Topic => $topic,
             Partition => $partition,
             FetchOffset => $start_offset,
@@ -643,7 +646,7 @@ Maximum number of offsets to be returned
 =cut
 sub offsets {
     my $self = shift;
-    return Kafka::IO::_sync( $self->async_offsets( @_ ) );
+    return promise_wait( $self->async_offsets( @_ ) );
 }
 sub async_offsets {
     my ( $self, $topic, $partition, $time, $max_number ) = @_;
@@ -752,7 +755,7 @@ The argument must be a normal non-false string of non-zero length.
 =cut
 sub commit_offsets {
     my ( $self, $topic, $partition, $offset, $group ) = @_;
-    return Kafka::IO::_sync( $self->async_commit_offsets(
+    return promise_wait( $self->async_commit_offsets(
             Topic => $topic,
             Partition => $partition,
             Offset => $offset,
@@ -829,7 +832,7 @@ The argument must be a normal non-false string of non-zero length.
 =cut
 sub fetch_offsets {
     my ( $self, $topic, $partition, $group ) = @_;
-    return Kafka::IO::_sync( $self->async_fetch_offsets(
+    return promise_wait( $self->async_fetch_offsets(
             Topic => $topic,
             Partition => $partition,
             Group => $group,

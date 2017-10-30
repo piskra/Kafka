@@ -62,6 +62,9 @@ use Kafka::Internals qw(
     _get_CorrelationId
     format_message
 );
+use Kafka::Promises qw(
+    promise_wait
+);
 
 
 
@@ -316,7 +319,7 @@ Do not use C<$Kafka::SEND_MAX_ATTEMPTS> in C<Kafka::Producer-<gt>send> request t
 =cut
 sub send {
     my $self = shift;
-    return Kafka::IO::_sync( $self->async_send( @_ ) );
+    return promise_wait( $self->async_send( @_ ) );
 }
 sub async_send {
     my ( $self, $topic, $partition, $messages, $keys, $compression_codec, $timestamps ) = @_;

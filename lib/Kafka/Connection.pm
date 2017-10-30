@@ -10,7 +10,7 @@ This documentation refers to C<Kafka::Connection> version 1.07 .
 
 =cut
 
-use 5.010;
+use 5.018; # __SUB__
 use strict;
 use warnings;
 
@@ -124,6 +124,10 @@ use Kafka::Internals qw(
     format_message
 );
 use Kafka::IO;
+use Kafka::Promises qw(
+    promise_resolved
+    promise_wait
+);
 use Kafka::Protocol qw(
     $BAD_OFFSET
     $IMPLEMENTED_APIVERSIONS
@@ -538,74 +542,68 @@ sub get_known_servers {
     return keys %{ $self->{_IO_cache} };
 }
 
-sub _get_api_versions {
+sub _async_get_api_versions {
     my ( $self, $server ) = @_;
 
     my $server_metadata = $self->{_IO_cache}->{$server};
     defined $server_metadata
       or die "Fatal error: server '$server' is unknown in IO cache, which should not happen";
 
-    # if we have cached data, just use it
-    defined $server_metadata->{_api_versions}
-      and return $server_metadata->{_api_versions};
+    my $server_api_versions = $server_metadata->{_api_versions} //= {};
 
-    # no cached data. Initialize empty one
-    my $server_api_versions = $server_metadata->{_api_versions} = {};
+    # if we have cached data, just use it
+    %$server_api_versions
+      and return promise_resolved( $server_api_versions );
 
     # use empty data if client doesn't want to detect API versions
     $self->{dont_load_supported_api_versions}
-      and return $server_api_versions;
+      and return promise_resolved( $server_api_versions );
 
     # call the server and try to get the supported API versions
-    my $api_versions = [];
-    my $error;
-    try {
-        # The ApiVersions API endpoint is only supported on Kafka versions >
-        # 0.10.0.0 so this call may fail. We simply ignore this failure and
-        # carry on.
-        $api_versions = $self->_get_supported_api_versions( $server );
-    }
-    catch {
-        $error = $_;
-    };
+    return $self->_async_get_supported_api_versions( $server )->then( sub
+    {
+        my ( $api_versions ) = @_;
 
-    if( defined $error ) {
-        if ( blessed( $error ) && $error->isa( 'Kafka::Exception' ) ) {
-            if( $error->code == $ERROR_MISMATCH_ARGUMENT ) {
-                # rethrow known fatal errors
+        foreach my $element (@$api_versions) {
+            # we want to choose which api version to use for each API call. We
+            # try to use the max version that the server supports, with
+            # fallback to the max version the protocol implements. If it's
+            # lower than the min version the kafka server supports, we set it
+            # to -1. If thie API endpoint is called, it'll die.
+            my $kafka_min_version = $element->{MinVersion};
+            my $kafka_max_version = $element->{MaxVersion};
+            my $api_key = $element->{ApiKey};
+            my $implemented_max_version = $IMPLEMENTED_APIVERSIONS->{$api_key} // -1;
+            my $version = $kafka_max_version;
+            $version > $implemented_max_version
+              and $version = $implemented_max_version;
+            $version < $kafka_min_version
+              and $version = -1;
+            $server_api_versions->{$api_key} = $version;
+        }
+
+        return $server_api_versions;
+    }, sub {
+        my ( $error ) = @_;
+
+        if( defined $error ) {
+            if ( blessed( $error ) && $error->isa( 'Kafka::Exception' ) ) {
+                if( $error->code == $ERROR_MISMATCH_ARGUMENT ) {
+                    # rethrow known fatal errors
+                    die $error;
+                }
+                $self->_remember_nonfatal_error( $error->code, $error, $server );
+            } else {
                 die $error;
             }
-            $self->_remember_nonfatal_error( $error->code, $error, $server );
-        } else {
-            die $error;
         }
-    }
-
-    foreach my $element (@$api_versions) {
-        # we want to choose which api version to use for each API call. We
-        # try to use the max version that the server supports, with
-        # fallback to the max version the protocol implements. If it's
-        # lower than the min version the kafka server supports, we set it
-        # to -1. If thie API endpoint is called, it'll die.
-        my $kafka_min_version = $element->{MinVersion};
-        my $kafka_max_version = $element->{MaxVersion};
-        my $api_key = $element->{ApiKey};
-        my $implemented_max_version = $IMPLEMENTED_APIVERSIONS->{$api_key} // -1;
-        my $version = $kafka_max_version;
-        $version > $implemented_max_version
-          and $version = $implemented_max_version;
-        $version < $kafka_min_version
-          and $version = -1;
-        $server_api_versions->{$api_key} = $version;
-    }
-
-    return $server_api_versions;
+    } );
 }
 
 # Returns the list of supported API versions. This is not really. *Warning*,
 # this call works only against Kafka 1.10.0.0
 
-sub _get_supported_api_versions {
+sub _async_get_supported_api_versions {
     my ( $self, $broker ) = @_;
 
     my $CorrelationId = _get_CorrelationId();
@@ -620,33 +618,34 @@ sub _get_supported_api_versions {
         ) if $self->debug_level;
     my $encoded_request = $protocol{ $APIKEY_APIVERSIONS }->{encode}->( $decoded_request );
 
-    my $encoded_response_ref;
-
     # receive apiversions
-    $encoded_response_ref = $self->_receive_data_from_some_broker( [ $broker ], $encoded_request );
+    return $self->_async_receive_data_from_some_broker( [ $broker ], $encoded_request )->then( sub
+    {
+        my ( $encoded_response_ref ) = @_;
 
-    unless ( $encoded_response_ref ) {
-        # NOTE: it is possible to repeat the operation here
-        $self->_error( $ERROR_CANNOT_RECV );
-    }
+        unless ( $encoded_response_ref ) {
+            # NOTE: it is possible to repeat the operation here
+            $self->_error( $ERROR_CANNOT_RECV );
+        }
 
-    my $decoded_response = $protocol{ $APIKEY_APIVERSIONS }->{decode}->( $encoded_response_ref );
-    say STDERR format_message( '[%s] apiversions response: %s',
-            scalar( localtime ),
-            $decoded_response,
-        ) if $self->debug_level;
-    ( defined( $decoded_response->{CorrelationId} ) && $decoded_response->{CorrelationId} == $CorrelationId )
-        # FATAL error
-        or $self->_error( $ERROR_MISMATCH_CORRELATIONID );
-    my $ErrorCode = $decoded_response->{ErrorCode};
+        my $decoded_response = $protocol{ $APIKEY_APIVERSIONS }->{decode}->( $encoded_response_ref );
+        say STDERR format_message( '[%s] apiversions response: %s',
+                scalar( localtime ),
+                $decoded_response,
+            ) if $self->debug_level;
+        ( defined( $decoded_response->{CorrelationId} ) && $decoded_response->{CorrelationId} == $CorrelationId )
+            # FATAL error
+            or $self->_error( $ERROR_MISMATCH_CORRELATIONID );
+        my $ErrorCode = $decoded_response->{ErrorCode};
 
-    # we asked a Kafka < 0.10 ( in this case the call is not
-    # implemented and it dies
-    $ErrorCode == $ERROR_NO_ERROR
-      or $self->_error($ErrorCode);
+        # we asked a Kafka < 0.10 ( in this case the call is not
+        # implemented and it dies
+        $ErrorCode == $ERROR_NO_ERROR
+          or $self->_error($ErrorCode);
 
-    my $api_versions = $decoded_response->{ApiVersions};
-    return $api_versions;
+        my $api_versions = $decoded_response->{ApiVersions};
+        return $api_versions;
+    } );
 }
 
 =head3 C<get_metadata( $topic )>
@@ -799,32 +798,9 @@ NOTE: $COMPRESSION_LZ4 requires Kafka 0.10 or higher, as initial implementation 
 =back
 
 =cut
-sub _delay
-{
-    my ( $seconds, @return ) = @_;
-    my $d = Promises::deferred();
-    AE::now_update; # Timers don't work well without accurate timekeeping.
-    my $w; $w= AE::timer(
-        $seconds, 0, sub {
-            $d->resolve( @return );
-            $w = undef;
-        }
-    );
-
-    return $d->promise();
-}
-
-sub _promise_resolved
-{
-    my ( @return ) = @_;
-    my $d = Promises::deferred();
-    $d->resolve( @return );
-    return $d;
-}
-
 sub receive_response_to_request {
     my $self = shift;
-    return Kafka::IO::_sync( $self->async_receive_response_to_request( @_ ) );
+    return promise_wait( $self->async_receive_response_to_request( @_ ) );
 }
 
 sub async_receive_response_to_request {
@@ -882,14 +858,14 @@ sub async_receive_response_to_request {
                 $ErrorCode == $ERROR_NO_ERROR ? 'refreshing metadata' : "ErrorCode ${ErrorCode}",
             ) if $self->debug_level;
 
-        return _delay( $self->{RETRY_BACKOFF} / 1000 )->then( sub
+        return promise_delay( $self->{RETRY_BACKOFF} / 1000 )->then( sub
         {
             $self->_update_metadata( $topic_name )
                 # FATAL error
                 or $self->_error( $ErrorCode || $ERROR_CANNOT_GET_METADATA, format_message( "topic='%s', partition=%s", $topic_name, $partition ), request => $request )
             ;
             if ( $host_to_send_to eq 'group_coordinator') {
-                $self->_update_group_coordinators($request->{GroupId})
+                return $self->_async_update_group_coordinators($request->{GroupId})->then( $main_try_cb );
             }
 
             return $main_try_cb->();
@@ -917,7 +893,7 @@ sub async_receive_response_to_request {
             my $group_id = $request->{GroupId};
             if ( !%{ $self->{_group_coordinators} } && defined $group_id) {
                 # first request
-                $self->_update_group_coordinators($group_id);
+                return $self->_async_update_group_coordinators($group_id)->then( $main_try_cb );
             }
             $server = $self->{_group_coordinators}->{$group_id};
             unless ( $server ) {
@@ -940,12 +916,20 @@ sub async_receive_response_to_request {
             # code knows how to handle it.
             $request->{ApiVersion} = $original_request_api_version;
             unless( defined $request->{ApiVersion} ) {
-                $request->{ApiVersion} = $self->_get_api_versions( $server )->{ $api_key };
+                return $self->_async_get_api_versions( $server )->then(
+                    sub {
+                        my ( $api_versions ) = @_;
+                        $original_request_api_version = $api_versions->{ $api_key };
+                        return $main_try_cb->();
+                    },
                 # API versions request may fail and the server may be disconnected
-                unless( $self->_is_IO_connected( $server ) ) {
-                    # this attempt does not count, assuming that _get_api_versions will not try to get them from failing broker again
-                    return $retry_cb->( no_count => 1 );
-                }
+                )->then( sub {
+                        unless( $self->_is_IO_connected( $server ) ) {
+                            # this attempt does not count, assuming that _get_api_versions will not try to get them from failing broker again
+                            return $retry_cb->( no_count => 1 );
+                        }
+                        return $main_try_cb->();
+                    } );
             }
 
             my $encoded_request = $protocol{ $api_key }->{encode}->( $request, $compression_codec );
@@ -990,7 +974,7 @@ sub async_receive_response_to_request {
                     },
                 ],
             };
-            $promise = _promise_resolved( $response );
+            $promise = promise_resolved( $response );
         } else {
             $promise = $self->_async_receiveIO( $io, $response_timeout )->then( sub
             {
@@ -1285,7 +1269,7 @@ sub _get_interviewed_servers {
 }
 
 # Refresh group_coordinators for given topic
-sub _update_group_coordinators {
+sub _async_update_group_coordinators {
     my ($self, $group_id) = @_;
 
     my $CorrelationId = _get_CorrelationId();
@@ -1305,55 +1289,63 @@ sub _update_group_coordinators {
     my @brokers = $self->_get_interviewed_servers;
 
     # receive coordinator data
-    $encoded_response_ref = $self->_receive_data_from_some_broker( \@brokers, $encoded_request );
+    return $self->_async_receive_data_from_some_broker( \@brokers, $encoded_request )->then( sub
+    {
+        my ( $encoded_response_ref ) = @_;
 
-    unless ( $encoded_response_ref ) {
-        # NOTE: it is possible to repeat the operation here
-        return;
-    }
+        return unless $encoded_response_ref;
 
-    my $decoded_response = $protocol{ $APIKEY_FINDCOORDINATOR }->{decode}->( $encoded_response_ref );
-    say STDERR format_message( '[%s] group coordinators: %s',
-            scalar( localtime ),
-            $decoded_response,
-        ) if $self->debug_level;
-    ( defined( $decoded_response->{CorrelationId} ) && $decoded_response->{CorrelationId} == $CorrelationId )
-        # FATAL error
-        or $self->_error( $ERROR_MISMATCH_CORRELATIONID );
-    $decoded_response->{ErrorCode}
-        and $self->_error( $decoded_response->{ErrorCode} );
+        my $decoded_response = $protocol{ $APIKEY_FINDCOORDINATOR }->{decode}->( $encoded_response_ref );
+        say STDERR format_message( '[%s] group coordinators: %s',
+                scalar( localtime ),
+                $decoded_response,
+            ) if $self->debug_level;
+        ( defined( $decoded_response->{CorrelationId} ) && $decoded_response->{CorrelationId} == $CorrelationId )
+            # FATAL error
+            or $self->_error( $ERROR_MISMATCH_CORRELATIONID );
+        $decoded_response->{ErrorCode}
+            and $self->_error( $decoded_response->{ErrorCode} );
 
-    my $IO_cache = $self->{_IO_cache};
-    my $server = $self->_build_server_name( @{ $decoded_response }{ 'Host', 'Port' } );
-    $IO_cache->{ $server } = {                      # can add new servers
-        IO      => $IO_cache->{ $server }->{IO},    # [ IO1, IO2, ... ] - may be empty
-        NodeId  => $decoded_response->{NodeId},
-        host    => $decoded_response->{Host},
-        port    => $decoded_response->{Port},
-    };
-    $self->{_group_coordinators}->{ $group_id } = $server;
+        my $IO_cache = $self->{_IO_cache};
+        my $server = $self->_build_server_name( @{ $decoded_response }{ 'Host', 'Port' } );
+        $IO_cache->{ $server } = {                      # can add new servers
+            IO      => $IO_cache->{ $server }->{IO},    # [ IO1, IO2, ... ] - may be empty
+            NodeId  => $decoded_response->{NodeId},
+            host    => $decoded_response->{Host},
+            port    => $decoded_response->{Port},
+        };
+        $self->{_group_coordinators}->{ $group_id } = $server;
 
-    return 1;
+        return 1;
+    } );
 }
 
-sub _receive_data_from_some_broker
+sub _async_receive_data_from_some_broker
 {
     my ( $self, $brokers, $encoded_request ) = @_;
 
-    my $encoded_response_ref;
-    foreach my $broker ( @$brokers ) {
-        my $io = $self->_connectIO( $broker )
-            or next;
-        my $sent = $self->_sendIO( $io, $encoded_request )
-            or next;
-        last if ( $encoded_response_ref = $self->_receiveIO( $io ) );
-    }
+    my @brokers_left = @$brokers;
 
-    return $encoded_response_ref
+    my $try_next_broker = sub {
+        my $broker = shift @brokers_left
+            or die "No brokers left to try";
+        my $io = $self->_connectIO( $broker )
+            or return __SUB__->();
+        my $sent = $self->_sendIO( $io, $encoded_request )
+            or return __SUB__->();
+
+        return $self->_async_receiveIO( $io )->then( sub { return @_ }, __SUB__ );
+    };
+
+    return $try_next_broker->();
 }
 
 # Refresh metadata for given topic
 sub _update_metadata {
+    my $self = shift;
+    return promise_wait( $self->_async_update_metadata( @_ ) );
+}
+sub _async_update_metadata {
     my ( $self, $topic, $is_recursive_call ) = @_;
 
     my $CorrelationId = _get_CorrelationId();
@@ -1370,95 +1362,96 @@ sub _update_metadata {
         ) if $self->debug_level;
     my $encoded_request = $protocol{ $APIKEY_METADATA }->{encode}->( $decoded_request );
 
-    my $encoded_response_ref;
     my @brokers = $self->_get_interviewed_servers;
 
-    # receive metadata
-    $encoded_response_ref = $self->_receive_data_from_some_broker( \@brokers, $encoded_request );
+    return $self->_async_receive_data_from_some_broker( \@brokers, $encoded_request )->then( sub
+    {
+        my ( $encoded_response_ref ) = @_;
 
-    unless ( $encoded_response_ref ) {
-        # NOTE: it is possible to repeat the operation here
-        return;
-    }
-
-    my $decoded_response = $protocol{ $APIKEY_METADATA }->{decode}->( $encoded_response_ref );
-    say STDERR format_message( '[%s] metadata response: %s',
-            scalar( localtime ),
-            $decoded_response,
-        ) if $self->debug_level;
-    ( defined( $decoded_response->{CorrelationId} ) && $decoded_response->{CorrelationId} == $CorrelationId )
-        # FATAL error
-        or $self->_error( $ERROR_MISMATCH_CORRELATIONID );
-
-    unless ( _ARRAY( $decoded_response->{Broker} ) ) {
-        if ( $self->{AutoCreateTopicsEnable} ) {
-            return $self->_attempt_update_metadata( $is_recursive_call, $topic, undef, $ERROR_NO_KNOWN_BROKERS );
-        } else {
-            # FATAL error
-            $self->_error( $ERROR_NO_KNOWN_BROKERS, format_message( "topic='%s'", $topic ) );
+        unless ( $encoded_response_ref ) {
+            # NOTE: it is possible to repeat the operation here
+            return;
         }
-    }
 
-    my $IO_cache = $self->{_IO_cache};
+        my $decoded_response = $protocol{ $APIKEY_METADATA }->{decode}->( $encoded_response_ref );
+        say STDERR format_message( '[%s] metadata response: %s',
+                scalar( localtime ),
+                $decoded_response,
+            ) if $self->debug_level;
+        ( defined( $decoded_response->{CorrelationId} ) && $decoded_response->{CorrelationId} == $CorrelationId )
+            # FATAL error
+            or $self->_error( $ERROR_MISMATCH_CORRELATIONID );
 
-    # Clear the previous information about the NodeId in the IO cache
-    $IO_cache->{ $_ }->{NodeId} = undef for @brokers;
+        unless ( _ARRAY( $decoded_response->{Broker} ) ) {
+            if ( $self->{AutoCreateTopicsEnable} ) {
+                return $self->_attempt_update_metadata( $is_recursive_call, $topic, undef, $ERROR_NO_KNOWN_BROKERS );
+            } else {
+                # FATAL error
+                $self->_error( $ERROR_NO_KNOWN_BROKERS, format_message( "topic='%s'", $topic ) );
+            }
+        }
 
-    #  In the IO cache update/add obtained server information
-    foreach my $received_broker ( @{ $decoded_response->{Broker} } ) {
-        my $server = $self->_build_server_name( @{ $received_broker }{ 'Host', 'Port' } );
-        $IO_cache->{ $server } = {                      # can add new servers
-            IO      => $IO_cache->{ $server }->{IO},    # [ IO1, IO2, ... ] -- may be empty
-            NodeId  => $received_broker->{NodeId},
-            host    => $received_broker->{Host},
-            port    => $received_broker->{Port},
-        };
-    }
+        my $IO_cache = $self->{_IO_cache};
 
-    #NOTE: IO cache does not remove server that's missing in metadata
+        # Clear the previous information about the NodeId in the IO cache
+        $IO_cache->{ $_ }->{NodeId} = undef for @brokers;
 
-    # Collect the received metadata
-    my $received_metadata   = {};
-    my $leaders             = {};
+        #  In the IO cache update/add obtained server information
+        foreach my $received_broker ( @{ $decoded_response->{Broker} } ) {
+            my $server = $self->_build_server_name( @{ $received_broker }{ 'Host', 'Port' } );
+            $IO_cache->{ $server } = {                      # can add new servers
+                IO      => $IO_cache->{ $server }->{IO},    # [ IO1, IO2, ... ] -- may be empty
+                NodeId  => $received_broker->{NodeId},
+                host    => $received_broker->{Host},
+                port    => $received_broker->{Port},
+            };
+        }
 
-    my $ErrorCode = $ERROR_NO_ERROR;
-    my( $TopicName, $partition );
-    METADATA_CREATION:
-    foreach my $topic_metadata ( @{ $decoded_response->{TopicMetadata} } ) {
-        $TopicName = $topic_metadata->{TopicName};
-        undef $partition;
-        last METADATA_CREATION
-            if ( $ErrorCode = $topic_metadata->{ErrorCode} ) != $ERROR_NO_ERROR;
+        #NOTE: IO cache does not remove server that's missing in metadata
 
-        foreach my $partition_metadata ( @{ $topic_metadata->{PartitionMetadata} } ) {
-            $partition = $partition_metadata->{Partition};
+        # Collect the received metadata
+        my $received_metadata   = {};
+        my $leaders             = {};
+
+        my $ErrorCode = $ERROR_NO_ERROR;
+        my( $TopicName, $partition );
+        METADATA_CREATION:
+        foreach my $topic_metadata ( @{ $decoded_response->{TopicMetadata} } ) {
+            $TopicName = $topic_metadata->{TopicName};
+            undef $partition;
             last METADATA_CREATION
-                if ( $ErrorCode = $partition_metadata->{ErrorCode} ) != $ERROR_NO_ERROR
-                    && $ErrorCode != $ERROR_REPLICA_NOT_AVAILABLE;
-            $ErrorCode = $ERROR_NO_ERROR;
+                if ( $ErrorCode = $topic_metadata->{ErrorCode} ) != $ERROR_NO_ERROR;
 
-            my $received_partition_data = $received_metadata->{ $TopicName }->{ $partition } = {};
-            my $leader = $received_partition_data->{Leader} = $partition_metadata->{Leader};
-            $received_partition_data->{Replicas}            = [ @{ $partition_metadata->{Replicas} } ];
-            $received_partition_data->{Isr}                 = [ @{ $partition_metadata->{Isr} } ];
+            foreach my $partition_metadata ( @{ $topic_metadata->{PartitionMetadata} } ) {
+                $partition = $partition_metadata->{Partition};
+                last METADATA_CREATION
+                    if ( $ErrorCode = $partition_metadata->{ErrorCode} ) != $ERROR_NO_ERROR
+                        && $ErrorCode != $ERROR_REPLICA_NOT_AVAILABLE;
+                $ErrorCode = $ERROR_NO_ERROR;
 
-            $leaders->{ $leader } = $self->_find_leader_server( $leader );
+                my $received_partition_data = $received_metadata->{ $TopicName }->{ $partition } = {};
+                my $leader = $received_partition_data->{Leader} = $partition_metadata->{Leader};
+                $received_partition_data->{Replicas}            = [ @{ $partition_metadata->{Replicas} } ];
+                $received_partition_data->{Isr}                 = [ @{ $partition_metadata->{Isr} } ];
+
+                $leaders->{ $leader } = $self->_find_leader_server( $leader );
+            }
         }
-    }
-    if ( $ErrorCode != $ERROR_NO_ERROR ) {
-        if ( exists $RETRY_ON_ERRORS{ $ErrorCode } ) {
-            return $self->_attempt_update_metadata( $is_recursive_call, $TopicName, $partition, $ErrorCode );
-        } else {
-            # FATAL error
-            $self->_error( $ErrorCode, format_message( "topic='%s'%s", $TopicName, defined( $partition ) ? ", partition=$partition" : '' ) );
+        if ( $ErrorCode != $ERROR_NO_ERROR ) {
+            if ( exists $RETRY_ON_ERRORS{ $ErrorCode } ) {
+                return $self->_attempt_update_metadata( $is_recursive_call, $TopicName, $partition, $ErrorCode );
+            } else {
+                # FATAL error
+                $self->_error( $ErrorCode, format_message( "topic='%s'%s", $TopicName, defined( $partition ) ? ", partition=$partition" : '' ) );
+            }
         }
-    }
 
-    # Update metadata for received topics
-    $self->{_metadata}->{ $_ }  = $received_metadata->{ $_ } foreach keys %{ $received_metadata };
-    $self->{_leaders}->{ $_ }   = $leaders->{ $_ } foreach keys %{ $leaders };
+        # Update metadata for received topics
+        $self->{_metadata}->{ $_ }  = $received_metadata->{ $_ } foreach keys %{ $received_metadata };
+        $self->{_leaders}->{ $_ }   = $leaders->{ $_ } foreach keys %{ $leaders };
 
-    return 1;
+        return 1;
+    } );
 }
 
 # trying to get the metadata without error
@@ -1586,7 +1579,7 @@ sub _sendIO {
 # Receive response from a given server
 sub _receiveIO {
     my $self = shift;
-    return Kafka::IO::_sync( $self->_async_receiveIO( @_ ) );
+    return promise_wait( $self->_async_receiveIO( @_ ) );
 }
 
 sub _async_receiveIO {
