@@ -750,16 +750,29 @@ The argument must be a normal non-false string of non-zero length.
 =back
 
 =cut
-sub async_commit_offsets {
+sub commit_offsets {
     my ( $self, $topic, $partition, $offset, $group ) = @_;
+    return Kafka::IO::_sync( $self->async_commit_offsets(
+            Topic => $topic,
+            Partition => $partition,
+            Offset => $offset,
+            Group => $group,
+        ) );
+}
 
+sub async_commit_offsets {
+    my ( $self, %args ) = @_;
 
+    my $topic = delete $args{Topic};
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'topic' )
         unless defined( $topic ) && ( $topic eq q{} || defined( _STRING( $topic ) ) ) && !utf8::is_utf8( $topic );
+    my $partition = delete $args{Partition};
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'partition' )
         unless defined( $partition ) && isint( $partition ) && $partition >= 0;
+    my $offset = delete $args{Offset};
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'offset' )
         unless defined( $offset ) && ( ( _isbig( $offset ) && $offset >= 0 ) || defined( _NONNEGINT( $offset ) ) );
+    my $group = delete $args{Group};
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group' )
         unless defined( $group ) && ( $group eq q{} || defined( _STRING( $group ) ) ) && !utf8::is_utf8( $group );
 
@@ -814,14 +827,25 @@ The argument must be a normal non-false string of non-zero length.
 =back
 
 =cut
-sub async_fetch_offsets {
+sub fetch_offsets {
     my ( $self, $topic, $partition, $group ) = @_;
+    return Kafka::IO::_sync( $self->async_fetch_offsets(
+            Topic => $topic,
+            Partition => $partition,
+            Group => $group,
+        ) );
+}
 
+sub async_fetch_offsets {
+    my ( $self, %args ) = @_;
 
+    my $topic = delete $args{Topic};
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'topic' )
         unless defined( $topic ) && ( $topic eq q{} || defined( _STRING( $topic ) ) ) && !utf8::is_utf8( $topic );
+    my $partition = delete $args{Partition};
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'partition' )
         unless defined( $partition ) && isint( $partition ) && $partition >= 0;
+    my $group = delete $args{Group};
     $self->_error( $ERROR_MISMATCH_ARGUMENT, 'group' )
         unless defined( $group ) && ( $group eq q{} || defined( _STRING( $group ) ) ) && !utf8::is_utf8( $group );
 
